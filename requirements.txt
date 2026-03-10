@@ -5,3 +5,5 @@ pyngrok
 python-dotenv
 httpx
 twilio
+python-multipart
+google-cloud-speech
