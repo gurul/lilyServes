@@ -11,7 +11,7 @@ from fastapi.responses import PlainTextResponse
 load_dotenv()
 
 from audio_utils import is_chunk_too_small, mulaw_to_wav
-from deepfake_client import send_to_deepfake
+# from deepfake_client import send_to_deepfake  # re-enable when deepfake endpoint is ready
 from scam_detector import analyze_scam
 from summarizer import generate_summary
 from transcriber import transcribe_chunk
@@ -19,7 +19,7 @@ from transcriber import transcribe_chunk
 PORT = int(os.environ.get("PORT", 8000))
 FORWARD_TO = os.environ.get("FORWARD_TO", "+12067418265")
 CHUNK_INTERVAL = 5  # seconds between Whisper API calls
-DEEPFAKE_EVERY_N_CHUNKS = 3  # send to deepfake endpoint every Nth chunk
+# DEEPFAKE_EVERY_N_CHUNKS = 3  # re-enable when deepfake endpoint is ready
 
 # ----- In-memory call state ------------------------------------------------
 # { call_sid: { audio_buffer, transcript, scam_score, client_ws, chunk_task, ratecv_state, chunk_count } }
@@ -219,9 +219,9 @@ async def _process_audio_chunk(call_sid: str, mulaw_chunk: bytes):
 
     state["chunk_count"] += 1
 
-    # Fire-and-forget deepfake check every Nth chunk
-    if state["chunk_count"] % DEEPFAKE_EVERY_N_CHUNKS == 0:
-        asyncio.create_task(_send_deepfake(call_sid, wav_bytes))
+    # # Fire-and-forget deepfake check every Nth chunk  (re-enable with deepfake endpoint)
+    # if state["chunk_count"] % DEEPFAKE_EVERY_N_CHUNKS == 0:
+    #     asyncio.create_task(_send_deepfake(call_sid, wav_bytes))
 
     await _push_to_client(call_sid, {
         "event": "transcript_update",
@@ -231,16 +231,16 @@ async def _process_audio_chunk(call_sid: str, mulaw_chunk: bytes):
     })
 
 
-async def _send_deepfake(call_sid: str, wav_bytes: bytes):
-    result = await send_to_deepfake(wav_bytes)
-    prob = result.get("probability")
-    if prob is not None:
-        print(f"[deepfake] call_sid={call_sid} probability={prob}")
-        await _push_to_client(call_sid, {
-            "event": "deepfake_score",
-            "call_sid": call_sid,
-            "probability": prob,
-        })
+# async def _send_deepfake(call_sid: str, wav_bytes: bytes):  # re-enable with deepfake endpoint
+#     result = await send_to_deepfake(wav_bytes)
+#     prob = result.get("probability")
+#     if prob is not None:
+#         print(f"[deepfake] call_sid={call_sid} probability={prob}")
+#         await _push_to_client(call_sid, {
+#             "event": "deepfake_score",
+#             "call_sid": call_sid,
+#             "probability": prob,
+#         })
 
 
 async def _push_to_client(call_sid: str, payload: dict):
