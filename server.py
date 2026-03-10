@@ -10,19 +10,17 @@ from fastapi.responses import PlainTextResponse
 
 load_dotenv()
 
-from audio_utils import is_chunk_too_small, mulaw_to_wav
-# from deepfake_client import send_to_deepfake  # re-enable when deepfake endpoint is ready
+from deepfake_client import check_deepfake
+from google_transcriber import GoogleStreamingSession
 from scam_detector import analyze_scam
 from summarizer import generate_summary
-from transcriber import transcribe_chunk
 
 PORT = int(os.environ.get("PORT", 8000))
 FORWARD_TO = os.environ.get("FORWARD_TO", "+12067418265")
-CHUNK_INTERVAL = 5  # seconds between Whisper API calls
-# DEEPFAKE_EVERY_N_CHUNKS = 3  # re-enable when deepfake endpoint is ready
+DEEPFAKE_BUFFER_SIZE = 80_000  # ~10 seconds of mulaw audio at 8 kHz
 
 # ----- In-memory call state ------------------------------------------------
-# { call_sid: { audio_buffer, transcript, scam_score, client_ws, chunk_task, ratecv_state, chunk_count } }
+# { call_sid: { stream_session, transcript, scam_score, client_ws } }
 calls: dict[str, dict] = {}
 
 # Clients waiting for a call to start (frontend connected before call arrives)
@@ -128,23 +126,59 @@ async def twilio_ws(websocket: WebSocket):
                 # Attach pending frontend client if available
                 client_ws = pending_clients.pop(0) if pending_clients else None
 
-                calls[call_sid] = {
-                    "audio_buffer": bytearray(),
-                    "transcript": [],
-                    "scam_score": 0,
-                    "client_ws": client_ws,
-                    "ratecv_state": None,
-                    "chunk_count": 0,
-                    "chunk_task": None,
-                }
-                calls[call_sid]["chunk_task"] = asyncio.create_task(
-                    _periodic_chunk_task(call_sid)
+                project_id = os.environ.get("PROJECT_ID", "heylily")
+
+                # Callback for final transcription results only
+                async def on_final(text: str, full_transcript: str, _sid=call_sid):
+                    state = calls.get(_sid)
+                    if not state:
+                        return
+                    state["transcript"].append(text)
+                    print(f"[transcript] {text}")
+
+                    scam = await analyze_scam(full_transcript, state["deepfake_score"])
+                    state["scam_level"] = scam["scam_level"]
+                    print(f"[scam] level={scam['scam_level']} reasoning={scam['reasoning']}")
+
+                    await _push_to_client(_sid, {
+                        "event": "transcript_update",
+                        "call_sid": _sid,
+                        "text": text,
+                        "full_transcript": full_transcript,
+                        "scam": scam,
+                    })
+
+                session = GoogleStreamingSession(
+                    project_id=project_id,
+                    on_final_result=on_final,
                 )
+
+                calls[call_sid] = {
+                    "stream_session": session,
+                    "transcript": [],
+                    "scam_level": "Low",
+                    "client_ws": client_ws,
+                    "deepfake_score": 0,
+                    "deepfake_buffer": bytearray(),
+                    "deepfake_submitted": False,
+                }
+
+                await session.start()
 
             elif event == "media":
                 if call_sid and call_sid in calls:
                     payload = base64.b64decode(msg["media"]["payload"])
-                    calls[call_sid]["audio_buffer"].extend(payload)
+                    calls[call_sid]["stream_session"].feed_audio(payload)
+
+                    # Buffer first 10s of audio for deepfake detection (one-shot)
+                    state = calls[call_sid]
+                    if not state["deepfake_submitted"]:
+                        state["deepfake_buffer"] += payload
+                        if len(state["deepfake_buffer"]) >= DEEPFAKE_BUFFER_SIZE:
+                            state["deepfake_submitted"] = True
+                            buf = bytes(state["deepfake_buffer"][:DEEPFAKE_BUFFER_SIZE])
+                            state["deepfake_buffer"] = bytearray()  # free memory
+                            asyncio.create_task(_run_deepfake_check(call_sid, buf))
 
             elif event == "stop":
                 print(f"[twilio_ws] Stream stopped — call_sid={call_sid}")
@@ -194,55 +228,6 @@ async def client_ws(websocket: WebSocket):
 
 # ----- Core processing helpers ----------------------------------------------
 
-async def _process_audio_chunk(call_sid: str, mulaw_chunk: bytes):
-    """Convert, transcribe, analyze, and push a single audio chunk."""
-    state = calls.get(call_sid)
-    if not state:
-        return
-
-    if is_chunk_too_small(mulaw_chunk):
-        return
-
-    wav_bytes, new_state = mulaw_to_wav(mulaw_chunk, state["ratecv_state"])
-    state["ratecv_state"] = new_state
-
-    text = await transcribe_chunk(wav_bytes)
-    if not text:
-        return
-
-    print(f"[transcript] {text}")
-    state["transcript"].append(text)
-
-    scam = analyze_scam(text)
-    if scam["score"] > state["scam_score"]:
-        state["scam_score"] = scam["score"]
-
-    state["chunk_count"] += 1
-
-    # # Fire-and-forget deepfake check every Nth chunk  (re-enable with deepfake endpoint)
-    # if state["chunk_count"] % DEEPFAKE_EVERY_N_CHUNKS == 0:
-    #     asyncio.create_task(_send_deepfake(call_sid, wav_bytes))
-
-    await _push_to_client(call_sid, {
-        "event": "transcript_update",
-        "call_sid": call_sid,
-        "text": text,
-        "scam": scam,
-    })
-
-
-# async def _send_deepfake(call_sid: str, wav_bytes: bytes):  # re-enable with deepfake endpoint
-#     result = await send_to_deepfake(wav_bytes)
-#     prob = result.get("probability")
-#     if prob is not None:
-#         print(f"[deepfake] call_sid={call_sid} probability={prob}")
-#         await _push_to_client(call_sid, {
-#             "event": "deepfake_score",
-#             "call_sid": call_sid,
-#             "probability": prob,
-#         })
-
-
 async def _push_to_client(call_sid: str, payload: dict):
     state = calls.get(call_sid)
     if not state:
@@ -255,55 +240,53 @@ async def _push_to_client(call_sid: str, payload: dict):
             state["client_ws"] = None
 
 
-async def _periodic_chunk_task(call_sid: str):
-    """Every CHUNK_INTERVAL seconds, drain the buffer and process it."""
-    try:
-        while True:
-            await asyncio.sleep(CHUNK_INTERVAL)
-            state = calls.get(call_sid)
-            if not state:
-                break
+async def _run_deepfake_check(call_sid: str, mulaw_bytes: bytes):
+    """One-shot deepfake detection on the first 10 seconds of audio."""
+    print(f"[deepfake] Checking {len(mulaw_bytes)} bytes for call_sid={call_sid}")
+    result = await check_deepfake(mulaw_bytes)
+    print(f"[deepfake] Result: score={result['score']} is_deepfake={result['is_deepfake']}")
 
-            # Atomically swap the buffer
-            chunk = bytes(state["audio_buffer"])
-            state["audio_buffer"] = bytearray()
+    state = calls.get(call_sid)
+    if not state:
+        return  # call ended while we were waiting
 
-            if chunk:
-                await _process_audio_chunk(call_sid, chunk)
-    except asyncio.CancelledError:
-        pass
+    if result["score"] is not None:
+        state["deepfake_score"] = result["score"]
+
+    await _push_to_client(call_sid, {
+        "event": "deepfake_result",
+        "call_sid": call_sid,
+        "deepfake_score": result["score"],
+        "is_deepfake": result["is_deepfake"],
+    })
 
 
 async def _finalize_call(call_sid: str):
-    """Process remaining audio, generate summary, clean up."""
+    """Stop the streaming session, generate summary, clean up."""
     state = calls.pop(call_sid, None)
     if not state:
         return
 
-    # Cancel the periodic task
-    task = state.get("chunk_task")
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    # Stop Google streaming and get final transcript
+    session = state.get("stream_session")
+    if session:
+        transcript_lines = await session.stop()
+        state["transcript"] = transcript_lines
 
-    # Drain remaining audio
-    remaining = bytes(state["audio_buffer"])
-    if remaining and not is_chunk_too_small(remaining):
-        wav_bytes, _ = mulaw_to_wav(remaining, state["ratecv_state"])
-        text = await transcribe_chunk(wav_bytes)
-        if text:
-            print(f"[transcript/final] {text}")
-            state["transcript"].append(text)
-            scam = analyze_scam(text)
-            await _push_to_client_direct(state, {
-                "event": "transcript_update",
-                "call_sid": call_sid,
-                "text": text,
-                "scam": scam,
-            })
+    # If call ended before 10s, run deepfake check on whatever audio we have
+    if not state.get("deepfake_submitted") and len(state.get("deepfake_buffer", b"")) > 0:
+        buf = bytes(state["deepfake_buffer"])
+        print(f"[deepfake] Call ended early, checking {len(buf)} bytes")
+        result = await check_deepfake(buf)
+        print(f"[deepfake] Result: score={result['score']} is_deepfake={result['is_deepfake']}")
+        if result["score"] is not None:
+            state["deepfake_score"] = result["score"]
+        await _push_to_client_direct(state, {
+            "event": "deepfake_result",
+            "call_sid": call_sid,
+            "deepfake_score": result["score"],
+            "is_deepfake": result["is_deepfake"],
+        })
 
     # Generate GPT-4o summary
     print(f"[summarizer] Generating summary for call_sid={call_sid} ...")
@@ -314,7 +297,8 @@ async def _finalize_call(call_sid: str):
         "event": "call_summary",
         "call_sid": call_sid,
         "summary": summary,
-        "total_scam_score": state["scam_score"],
+        "scam_level": state["scam_level"],
+        "deepfake_score": state["deepfake_score"],
     })
 
 

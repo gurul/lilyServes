@@ -1,4 +1,16 @@
-from transcriber import get_client
+import os
+
+import openai
+
+_client: openai.AsyncOpenAI | None = None
+
+
+def get_client() -> openai.AsyncOpenAI:
+    global _client
+    if _client is None:
+        _client = openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _client
+
 
 SYSTEM_PROMPT = """You are a call analysis assistant specializing in scam detection.
 Given a phone call transcript, produce a structured JSON response with these fields:
