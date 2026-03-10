@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+openai>=1.0.0
+pyngrok
+python-dotenv
+httpx
+twilio
