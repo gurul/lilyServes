@@ -1,13 +1,5 @@
 # lilyServes
 
-<p align="center">
-  <img src="assets/geekwire-pitch.png" alt="PSL Managing Director Greg Gottesman takes a live demo call during the heyLily pitch at Pioneer Square Labs" width="100%">
-</p>
-
-<p align="center">
-  <i>Live scam-call screening demoed at Pioneer Square Labs — <a href="https://www.geekwire.com/2026/heres-the-pitch-uw-students-get-in-the-room-with-key-investors-to-share-their-ai-startup-ideas/">GeekWire</a></i>
-</p>
-
 **Live scam detection for phone calls.** The real-time call-listening backend behind [heyLily](https://github.com/gurul/lilyWebsite), a gentle AI phone companion for older adults and the family who support them.
 
 A scam call only works while it is happening. By the time a transcript is reviewed, or a family member hears about the gift cards, the money is gone. lilyServes listens to a call as it rings through — the caller's audio is streamed off Twilio, transcribed sentence by sentence, and rated for scam risk on every new sentence — so the warning arrives during the conversation rather than after it. The call itself is untouched: the stream is forked, the phone still rings, and the person on the line talks to whoever called them.
