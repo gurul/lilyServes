@@ -4,3 +4,8 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+data/
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,17 @@
+target-version = "py39"
+line-length = 110
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "BLE", "PL"]
+ignore = [
+    "BLE001",  # blanket except is intentional: a live call must never crash on a side-channel failure
+    "B008",    # FastAPI's Depends-in-default idiom
+    "UP031",   # %-format in struct.pack width is clearer
+    "PLW1508", # int default for os.environ.get is fine pre-cast
+    "E501",    # long regex/SQL lines
+    "PLR0913", "PLR0912", "PLR0915", "PLR2004",  # complexity/magic-number heuristics
+    "PLR0917", "PLR5501", "PLR1714",             # style preferences, not defects
+    "PLW0603",  # module-singleton lazy init uses global by design
+    "PLC0415",  # lazy imports keep optional deps (ngrok/twilio) out of the boot path
+    "E402",     # server.py must load_dotenv() before importing config-reading modules
+]
