@@ -9,10 +9,10 @@ A scam call only works while it is happening. By the time a transcript is review
 - **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. Repeat scammers are blocked outright. Every screen shows up on the dashboard as a *Stayed safe* event.
 - **Live scam detection, two tiers.** A sub-millisecond heuristic engine (gift cards, wire transfers, urgency, secrecy, grandparent-scam patterns, remote-access requests, verification-code requests, …) scores every sentence instantly; an LLM refines the assessment asynchronously over a rolling window. The displayed risk level is monotonic — it can only escalate during a call.
 - **Deepfake detection.** The first ~10 seconds of caller audio go to Hive AI. A synthetic voice floors the risk at Medium, raises an urgent alert, and can never *lower* a score.
-- **Cognitive continuity.** SQLite-backed caller memory: who called, how often, what the last call was about, open commitments. When a call starts, the dashboard receives gentle context about the caller — bridging the gaps for someone living with memory changes.
+- **Cognitive continuity — lilyMemory.** A purpose-built long-term memory engine. Every call, commitment, trusted contact, and scam encounter becomes a typed memory (`episode` / `commitment` / `person` / `preference` / `win` / `safety`) with importance, confidence, entities, and topics. Recall is hybrid — semantic (embeddings + cosine) fused with lexical (FTS5 BM25), importance, and recency — so when a call starts the dashboard receives genuinely related context about the caller, bridging the gaps for someone living with memory changes. Alongside it, a structured SQLite store tracks caller history, trust, and scam strikes.
 - **Event capture (Active Assistance).** "Main St. Pharmacy confirmed pickup for Friday @ 4:00 PM" becomes a structured reminder, extracted mid-call and pushed to the dashboard as an *Event captured* item. Post-call summaries also sweep for missed commitments.
 - **Family dashboard, smart updates.** Any number of clients connect over WebSocket and get a full snapshot plus live events. Every item carries an importance level (`info` / `notable` / `important` / `urgent`); only `important+` is flagged `notify: true` — peace of mind, not surveillance.
-- **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored passes through redaction that scrubs card numbers, SSNs, and one-time codes.
+- **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored — including every memory — passes through redaction that scrubs card numbers, SSNs, and one-time codes, and any memory can be deleted via the API (`DELETE /api/memories/{id}`). You own your data, always. `MEMORY_EMBEDDINGS=false` keeps memory fully offline (lexical recall only).
 - **Optional intervention.** With `AUTO_INTERVENE=true`, a call that reaches High risk is redirected to a polite hangup via the Twilio REST API. Off by default — warn, don't act.
 
 ## Latency model
@@ -102,7 +102,9 @@ All configuration is environment variables (see `.env.example` for the full anno
 | `/ws/client` | WebSocket | `?token=` | Dashboard egress: snapshot on connect, then live events |
 | `GET /api/activity` · `/api/events` · `/api/calls` · `/api/caller/{number}` | HTTP | token | Activity feed, open reminders, call history, caller context |
 | `POST /api/events/{id}/complete` | HTTP | token | Mark a reminder done |
-| `POST /api/contacts/trusted` | HTTP | token | Add/remove a trusted contact |
+| `POST /api/contacts/trusted` | HTTP | token | Add/remove a trusted contact (also remembered as a `person` memory) |
+| `GET /api/memories` · `GET /api/memories/search?q=` | HTTP | token | Browse / hybrid-search long-term memories |
+| `DELETE /api/memories/{id}` | HTTP | token | Forget a memory permanently |
 
 Events pushed on `/ws/client` (all carry `importance` and `notify`):
 
@@ -110,6 +112,7 @@ Events pushed on `/ws/client` (all carry `importance` and `notify`):
 |---|---|
 | `snapshot` | On connect: active calls, recent activity, open events |
 | `call_started` | Stream starts — includes `caller_context` (name, history, open commitments) |
+| `caller_memories` | Moments later: hybrid-recalled long-term memories about this caller |
 | `transcript_interim` / `transcript_update` | As words are spoken / each final sentence (instant provisional risk) |
 | `scam_update` | LLM-refined risk level |
 | `deepfake_result` | Once, ~10 s in |
@@ -126,7 +129,8 @@ Events pushed on `/ws/client` (all carry `importance` and `notify`):
 | `scam_heuristics.py` | Instant regex risk engine (16 weighted patterns) |
 | `scam_detector.py` | LLM refinement over a rolling window, deepfake/heuristic floors |
 | `events.py` | Commitment extraction with a cheap trigger gate |
-| `memory_store.py` | SQLite (WAL) caller memory, calls, events, activity; redaction |
+| `memory_store.py` | SQLite (WAL) operational store: callers, calls, events, activity; redaction |
+| `lilyMemory/` | Long-term memory engine: typed memories, embeddings, FTS5 + cosine hybrid recall |
 | `google_transcriber.py` | STT V2 bidirectional stream, bounded queue, reconnect-before-timeout |
 | `deepfake_client.py` | Hive AI call over a warm pooled connection |
 | `summarizer.py` | Shared OpenAI client, structured post-call summary |

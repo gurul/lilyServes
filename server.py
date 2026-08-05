@@ -37,6 +37,7 @@ from deepfake_client import check_deepfake, close_http
 from events import extract_events, has_event_trigger
 from google_transcriber import GoogleStreamingSession
 from hub import IMPORTANT, INFO, NOTABLE, URGENT, hub, push_activity
+from lilyMemory import MemoryService
 from memory_store import MemoryStore, redact
 from scam_detector import analyze_scam
 from scam_heuristics import max_level, score_text
@@ -51,6 +52,11 @@ log = logging.getLogger("lily.server")
 DEEPFAKE_BUFFER_SIZE = 80_000  # ~10 seconds of mulaw audio at 8 kHz
 
 store = MemoryStore(settings.data_dir, settings.retain_transcripts)
+memory = (
+    MemoryService(settings.data_dir)
+    if settings.memory_embeddings
+    else MemoryService.lexical_only(settings.data_dir)
+)
 
 # Keep strong references to fire-and-forget tasks (asyncio only holds weak ones).
 _background: set[asyncio.Task] = set()
@@ -67,6 +73,7 @@ def _spawn(coro) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await store.open()
+    await memory.open()
 
     public_url = settings.public_url
     tunnel = None
@@ -98,6 +105,7 @@ async def lifespan(app: FastAPI):
     if _background:
         await asyncio.gather(*_background, return_exceptions=True)
     await close_http()
+    await memory.close()
     await store.close()
     if tunnel is not None:
         from pyngrok import ngrok
@@ -296,6 +304,24 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
         "screened": screened,
         "caller_context": ctx,
     }, NOTABLE)
+    # Long-term memories arrive as a follow-up so the embedding round-trip
+    # never delays the call_started push.
+    _spawn(_recall_caller_memories(call_sid, caller, ctx.get("name", "")))
+
+
+async def _recall_caller_memories(call_sid: str, caller: str, name: str) -> None:
+    try:
+        memories = await memory.caller_context(caller, name)
+    except Exception:
+        log.exception("memory recall failed for %s", caller)
+        return
+    if memories:
+        await hub.broadcast({
+            "event": "caller_memories",
+            "call_sid": call_sid,
+            "caller": caller,
+            "memories": memories,
+        }, NOTABLE)
 
 
 async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None:
@@ -414,6 +440,7 @@ async def _capture_events(call_sid: str, sentence: str) -> None:
     caller = session.caller if session else "unknown"
     for event in await extract_events(sentence):
         event_id = await store.add_event(call_sid, caller, event["title"], event["when"])
+        _spawn(memory.remember_commitment(call_sid, caller, event["title"], event["when"]))
         title = event["title"] + (f" — {event['when']}" if event["when"] else "")
         await push_activity(
             "event_captured", "Event captured", title, NOTABLE, call_sid, store,
@@ -469,6 +496,9 @@ async def _finalize_call(call_sid: str) -> None:
     _spawn(store.record_call_end(
         call_sid, session.caller, final_level,
         session.deepfake_score, summary, session.transcript,
+    ))
+    _spawn(memory.remember_call(
+        call_sid, session.caller, str(summary.get("summary", "")), final_level,
     ))
     for event in summary.get("events", []):
         if isinstance(event, dict) and event.get("title"):
@@ -565,7 +595,32 @@ async def api_set_trusted(payload: dict):
     number = str(payload.get("number", "")).strip()
     if not number:
         raise HTTPException(status_code=422, detail="number required")
-    await store.set_trusted(number, bool(payload.get("trusted", True)), str(payload.get("name", "")))
+    trusted = bool(payload.get("trusted", True))
+    name = str(payload.get("name", ""))
+    await store.set_trusted(number, trusted, name)
+    if trusted and name:
+        _spawn(memory.remember_person(number, name))
+    return {"ok": True}
+
+
+# ----- Memory REST (lilyMemory) ----------------------------------------------
+
+@app.get("/api/memories", dependencies=[Depends(require_client_token)])
+async def api_memories(limit: int = 50, memory_type: str = "", caller: str = ""):
+    return {"memories": await memory.recent(min(limit, 200), memory_type, caller)}
+
+
+@app.get("/api/memories/search", dependencies=[Depends(require_client_token)])
+async def api_memories_search(q: str, limit: int = 10, caller: str = ""):
+    return {"memories": await memory.recall(q, limit=min(limit, 50), caller=caller)}
+
+
+@app.delete("/api/memories/{memory_id}", dependencies=[Depends(require_client_token)])
+async def api_memories_delete(memory_id: str):
+    """You own your data — any memory can be deleted."""
+    deleted = await memory.forget(memory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="memory not found")
     return {"ok": True}
 
 
