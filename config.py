@@ -44,6 +44,10 @@ class Settings:
     data_dir: str = "data"
     retain_transcripts: bool = False
 
+    # Long-term memory (lilyMemory). Embeddings enrich recall; disabling
+    # them keeps memory fully offline (lexical search only).
+    memory_embeddings: bool = True
+
     screen_unknown_callers: bool = True
     trusted_numbers: list[str] = field(default_factory=list)
 
@@ -74,6 +78,7 @@ class Settings:
             client_token=os.environ.get("CLIENT_TOKEN", ""),
             data_dir=os.environ.get("DATA_DIR", "data"),
             retain_transcripts=_bool("RETAIN_TRANSCRIPTS", False),
+            memory_embeddings=_bool("MEMORY_EMBEDDINGS", True),
             screen_unknown_callers=_bool("SCREEN_UNKNOWN_CALLERS", True),
             trusted_numbers=_csv("TRUSTED_NUMBERS"),
             auto_intervene=_bool("AUTO_INTERVENE", False),
