@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from risk_fusion import RiskFusion
+from lily.detection.fusion import RiskFusion
 
 
 @dataclass

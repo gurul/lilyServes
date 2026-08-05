@@ -1,4 +1,4 @@
-"""lilyMemory facade — what the rest of lilyServes talks to.
+"""lily.memory facade — what the rest of lilyServes talks to.
 
 remember() writes instantly and computes the embedding in the background;
 recall() fuses semantic similarity, lexical match, importance, and recency
@@ -12,10 +12,10 @@ import logging
 import math
 import time
 
-from lilyMemory.embeddings import NullEmbedder, OpenAIEmbedder
-from lilyMemory.models import Memory, MemoryType
-from lilyMemory.store import MemoryDB
-from memory_store import redact
+from lily.memory.embeddings import NullEmbedder, OpenAIEmbedder
+from lily.memory.models import Memory, MemoryType
+from lily.memory.operational import redact
+from lily.memory.store import MemoryDB
 
 log = logging.getLogger("lily.memory")
 

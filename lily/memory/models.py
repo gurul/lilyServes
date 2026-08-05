@@ -1,4 +1,4 @@
-"""Memory model for lilyMemory.
+"""Memory model for lily.memory.
 
 Memory types are shaped around what heyLily promises its users, not around a
 generic memory taxonomy:

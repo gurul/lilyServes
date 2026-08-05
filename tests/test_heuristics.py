@@ -1,4 +1,4 @@
-from scam_heuristics import max_level, score_text
+from lily.detection.heuristics import max_level, score_text
 
 
 def test_benign_conversation_is_low():

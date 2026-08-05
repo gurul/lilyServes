@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from memory_store import MemoryStore, redact
+from lily.memory.operational import MemoryStore, redact
 
 
 def test_redact_card_numbers():

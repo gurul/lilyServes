@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from xml.sax.saxutils import escape
 
-from scam_heuristics import score_text
+from lily.detection.heuristics import score_text
 
 log = logging.getLogger("lily.screening")
 

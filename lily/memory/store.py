@@ -1,4 +1,4 @@
-"""SQLite persistence for lilyMemory.
+"""SQLite persistence for lily.memory.
 
 Same event-loop discipline as the rest of lilyServes: WAL mode, every DB
 operation runs on a worker thread behind a lock. FTS5 provides lexical
@@ -15,8 +15,8 @@ import sqlite3
 
 import numpy as np
 
-from lilyMemory.embeddings import pack_vector
-from lilyMemory.models import Memory
+from lily.memory.embeddings import pack_vector
+from lily.memory.models import Memory
 
 log = logging.getLogger("lily.memory.store")
 
@@ -112,7 +112,7 @@ class MemoryDB:
             return conn
 
         self._conn = await asyncio.to_thread(setup)
-        log.info("lilyMemory open at %s (fts=%s)", self._path, self.fts_enabled)
+        log.info("lily.memory open at %s (fts=%s)", self._path, self.fts_enabled)
 
     async def close(self) -> None:
         if self._conn is not None:

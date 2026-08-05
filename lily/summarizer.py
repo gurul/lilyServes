@@ -7,7 +7,7 @@ import os
 
 import openai
 
-from config import settings
+from lily.config import settings
 
 log = logging.getLogger("lily.summarizer")
 
