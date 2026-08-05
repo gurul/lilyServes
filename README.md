@@ -68,7 +68,7 @@ On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — i
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 37 tests: heuristics, screening, memory/redaction, audio, auth
+pytest          # 53 tests: heuristics, fusion, screening, memory, audio, auth
 ruff check .
 ```
 
@@ -122,24 +122,42 @@ Events pushed on `/ws/client` (all carry `importance` and `notify`):
 
 ## Project layout
 
-| Path | What |
-|---|---|
-| `server.py` | FastAPI app: webhooks, both WebSockets, hot-path orchestration, dashboard REST |
-| `screening.py` | Screening routes, answer assessment, all TwiML builders |
-| `scam_heuristics.py` | Instant regex risk engine (16 weighted patterns) |
-| `scam_detector.py` | LLM refinement over a rolling window, deepfake/heuristic floors |
-| `events.py` | Commitment extraction with a cheap trigger gate |
-| `memory_store.py` | SQLite (WAL) operational store: callers, calls, events, activity; redaction |
-| `lilyMemory/` | Long-term memory engine: typed memories, embeddings, FTS5 + cosine hybrid recall |
-| `google_transcriber.py` | STT V2 bidirectional stream, bounded queue, reconnect-before-timeout |
-| `deepfake_client.py` | Hive AI call over a warm pooled connection |
-| `summarizer.py` | Shared OpenAI client, structured post-call summary |
-| `hub.py` | Dashboard fan-out + importance/notification tagging |
-| `call_state.py` | Multi-call registry and per-call session state |
-| `auth.py` | Twilio signature validation, dashboard token check |
-| `audio.py` | mulaw → WAV, pure-Python fallback for 3.13+ |
-| `config.py` | Env-driven settings |
-| `tests/` | 37 unit tests (no network required) |
+```
+server.py                  entry point — python server.py
+lily/
+├── app.py                 FastAPI app: webhooks, WebSockets, hot-path orchestration, REST
+├── config.py              env-driven settings
+├── auth.py                Twilio signature validation, dashboard token check
+├── calls.py               multi-call registry and per-call session state
+├── hub.py                 dashboard fan-out + importance/notification tagging
+├── screening.py           screening routes, answer assessment, TwiML builders
+├── events.py              commitment extraction with a cheap trigger gate
+├── summarizer.py          shared OpenAI client, structured post-call summary
+├── transcription.py       STT V2 stream, bounded queue, reconnect-before-timeout
+├── audio.py               mulaw → WAV, pure-Python fallback for 3.13+
+├── detection/
+│   ├── heuristics.py      instant regex risk engine (16 weighted patterns)
+│   ├── detector.py        criteria-rubric LLM tier, 3-way verdict
+│   ├── fusion.py          EWMA multi-signal risk fusion, kill-chain stages
+│   └── deepfake.py        Hive AI check over a warm pooled connection
+└── memory/
+    ├── models.py          typed memories (episode/commitment/person/preference/win/safety)
+    ├── embeddings.py      OpenAI embeddings, injectable provider
+    ├── store.py           SQLite + FTS5 + in-process vector index
+    ├── service.py         hybrid recall facade (cosine + BM25 + salience)
+    └── operational.py     callers/calls/events/activity store; PII redaction
+tests/                     53 unit tests (no network required)
+```
+
+## Research grounding
+
+The detection layer implements findings from the 2020–2026 vishing-detection literature:
+
+- **Criteria-rubric prompting with a 3-way verdict** (scam / uncertain / safe): criteria-prompted LLMs hold ~95% accuracy under adversarial rephrasing while keyword classifiers collapse; UNCERTAIN trades a little recall for the precision that preserves trust in alerts ([arXiv:2506.06180](https://arxiv.org/abs/2506.06180), [arXiv:2502.03964](https://arxiv.org/abs/2502.03964))
+- **EWMA risk accumulation behind dual thresholds** (soft-warn / hard-alert) instead of independent per-sentence verdicts ([arXiv:2509.05362](https://arxiv.org/abs/2509.05362))
+- **Immediate escalation on payment-stage markers** — scam-progression studies show only 1–2 conversational turns of lead time once payment language appears ([arXiv:2605.12243](https://arxiv.org/abs/2605.12243)); the regex tier escalates but never clears, because keyword features are exactly what adversarial rephrasing removes ([arXiv:2507.16291](https://arxiv.org/abs/2507.16291))
+- **Deepfake score as a risk multiplier, not a standalone alarm** — 8 kHz telephony destroys the high-frequency artifacts detectors depend on ([arXiv:2411.00121](https://arxiv.org/abs/2411.00121))
+- **PII sanitization before any cloud LLM call** ([arXiv:2510.18493](https://arxiv.org/abs/2510.18493))
 
 ## Security & privacy posture
 

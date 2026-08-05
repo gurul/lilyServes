@@ -1,5 +1,5 @@
-from risk_fusion import THETA_ALERT, RiskFusion
-from scam_heuristics import score_text
+from lily.detection.fusion import THETA_ALERT, RiskFusion
+from lily.detection.heuristics import score_text
 
 
 def test_benign_call_stays_low():

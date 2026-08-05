@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from scam_heuristics import HeuristicResult
+from lily.detection.heuristics import HeuristicResult
 
 # Dual thresholds on the EWMA-accumulated risk (0..1).
 THETA_WARN = 0.35
@@ -94,7 +94,7 @@ class RiskFusion:
                 self.ewma = max(self.ewma, THETA_ALERT)
         return self.state()
 
-    def on_deepfake(self, score: "float | None") -> FusionState:
+    def on_deepfake(self, score: float | None) -> FusionState:
         if score is not None:
             self.deepfake_score = max(0.0, min(1.0, score))
         return self.state()

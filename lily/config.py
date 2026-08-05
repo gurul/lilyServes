@@ -44,7 +44,7 @@ class Settings:
     data_dir: str = "data"
     retain_transcripts: bool = False
 
-    # Long-term memory (lilyMemory). Embeddings enrich recall; disabling
+    # Long-term memory (lily.memory). Embeddings enrich recall; disabling
     # them keeps memory fully offline (lexical search only).
     memory_embeddings: bool = True
 

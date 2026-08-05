@@ -1,7 +1,7 @@
 import io
 import wave
 
-from audio import mulaw_to_wav
+from lily.audio import mulaw_to_wav
 
 
 def test_mulaw_to_wav_shape():
@@ -29,7 +29,7 @@ def test_pure_python_fallback_matches_audioop():
         return  # 3.13+: nothing to compare against
     import struct
 
-    from audio import _TABLE
+    from lily.audio import _TABLE
 
     sample_bytes = bytes(range(256))
     expected = audioop.ulaw2lin(sample_bytes, 2)

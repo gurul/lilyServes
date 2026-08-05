@@ -6,8 +6,8 @@ import logging
 
 import httpx
 
-from audio import mulaw_to_wav
-from config import settings
+from lily.audio import mulaw_to_wav
+from lily.config import settings
 
 log = logging.getLogger("lily.deepfake")
 

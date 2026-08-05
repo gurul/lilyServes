@@ -11,8 +11,8 @@ import json
 import logging
 import re
 
-from config import settings
-from summarizer import get_client
+from lily.config import settings
+from lily.summarizer import get_client
 
 log = logging.getLogger("lily.events")
 

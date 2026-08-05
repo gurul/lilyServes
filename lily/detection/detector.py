@@ -21,10 +21,10 @@ from __future__ import annotations
 import json
 import logging
 
-from config import settings
-from memory_store import redact
-from scam_heuristics import score_text
-from summarizer import get_client
+from lily.config import settings
+from lily.detection.heuristics import score_text
+from lily.memory.operational import redact
+from lily.summarizer import get_client
 
 log = logging.getLogger("lily.scam")
 

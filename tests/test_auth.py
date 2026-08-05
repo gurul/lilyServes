@@ -1,5 +1,5 @@
-from auth import check_client_token, compute_twilio_signature
-from config import settings
+from lily.auth import check_client_token, compute_twilio_signature
+from lily.config import settings
 
 
 def test_twilio_signature_matches_sdk_reference():

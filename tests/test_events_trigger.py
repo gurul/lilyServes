@@ -1,4 +1,4 @@
-from events import has_event_trigger
+from lily.events import has_event_trigger
 
 
 def test_pharmacy_pickup_triggers():

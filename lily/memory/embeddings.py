@@ -1,4 +1,4 @@
-"""Embedding provider for lilyMemory.
+"""Embedding provider for lily.memory.
 
 Default implementation uses OpenAI (`text-embedding-3-small` at 512 dims —
 3x cheaper to store and compare than full width, with negligible quality
@@ -32,7 +32,7 @@ class OpenAIEmbedder:
         if not texts:
             return []
         try:
-            from summarizer import get_client
+            from lily.summarizer import get_client
 
             response = await get_client().embeddings.create(
                 model=self.model,
@@ -47,7 +47,7 @@ class OpenAIEmbedder:
 
 
 class NullEmbedder:
-    """Disables semantic search; lilyMemory runs lexical-only."""
+    """Disables semantic search; lily.memory runs lexical-only."""
 
     dimensions = 0
 

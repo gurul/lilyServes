@@ -1,4 +1,4 @@
-"""lilyMemory — Lily's long-term memory engine.
+"""lily.memory — Lily's long-term memory engine.
 
 A ground-up memory system built for heyLily: typed memories with importance
 and confidence, entity and topic tagging, hybrid lexical + semantic recall,
@@ -10,7 +10,7 @@ Assistance (commitments that persist), and the family dashboard's memory
 views. Privacy first: everything stored is redacted, and any memory can be
 deleted — you own your data, always.
 """
-from lilyMemory.models import Memory, MemoryType
-from lilyMemory.service import MemoryService
+from lily.memory.models import Memory, MemoryType
+from lily.memory.service import MemoryService
 
 __all__ = ["Memory", "MemoryService", "MemoryType"]

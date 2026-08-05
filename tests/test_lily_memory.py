@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from lilyMemory import MemoryService, MemoryType
+from lily.memory import MemoryService, MemoryType
 
 
 class FakeEmbedder:
