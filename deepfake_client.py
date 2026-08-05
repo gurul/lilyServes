@@ -1,61 +1,59 @@
-import audioop
+"""Hive AI deepfake detection on the first seconds of caller audio."""
+from __future__ import annotations
+
 import base64
-import io
-import os
-import wave
+import logging
 
 import httpx
+
+from audio import mulaw_to_wav
+from config import settings
+
+log = logging.getLogger("lily.deepfake")
 
 HIVE_API_URL = (
     "https://api.thehive.ai/api/v3/hive/"
     "ai-generated-and-deepfake-content-detection"
 )
-HIVE_API_SECRET = os.environ.get("HIVE_API_SECRET", "")
-TIMEOUT = 30.0  # seconds – generous for 10s of audio processing
+TIMEOUT = 30.0  # generous for ~10s of audio processing
 DEEPFAKE_THRESHOLD = 0.5
 
+# Shared pooled client: keeps the TLS connection warm across calls so the
+# handshake isn't paid inside a live call.
+_http: httpx.AsyncClient | None = None
 
-def mulaw_to_wav(mulaw_bytes: bytes) -> bytes:
-    """Convert raw mulaw audio (8 kHz, mono) to a PCM WAV file in memory."""
-    pcm_data = audioop.ulaw2lin(mulaw_bytes, 2)  # 16-bit PCM
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)       # 16-bit
-        wf.setframerate(8000)
-        wf.writeframes(pcm_data)
-    return buf.getvalue()
+
+def _get_http() -> httpx.AsyncClient:
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(
+            timeout=TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=2, max_connections=4),
+        )
+    return _http
+
+
+async def close_http() -> None:
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
 
 
 async def check_deepfake(mulaw_bytes: bytes) -> dict:
-    """
-    Send audio to HiveAI and return deepfake detection result.
-
-    Returns:
-        {"score": float (0.0-1.0), "is_deepfake": bool}
-        or {"score": None, "is_deepfake": False} on error.
-    """
-    if not HIVE_API_SECRET:
-        print("[deepfake] HIVE_API_SECRET not set, skipping")
+    """Send audio to Hive AI; returns {"score": float|None, "is_deepfake": bool}."""
+    if not settings.hive_api_secret:
+        log.info("HIVE_API_SECRET not set, skipping deepfake check")
         return {"score": None, "is_deepfake": False}
 
     try:
-        wav_bytes = mulaw_to_wav(mulaw_bytes)
-        wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
-        data_uri = f"data:audio/wav;base64,{wav_b64}"
+        wav_b64 = base64.b64encode(mulaw_to_wav(mulaw_bytes)).decode("ascii")
+        payload = {"input": [{"media_base64": f"data:audio/wav;base64,{wav_b64}"}]}
+        headers = {"Authorization": f"Bearer {settings.hive_api_secret}"}
 
-        payload = {
-            "input": [{"media_base64": data_uri}],
-        }
-        headers = {
-            "Authorization": f"Bearer {HIVE_API_SECRET}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            resp = await client.post(HIVE_API_URL, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await _get_http().post(HIVE_API_URL, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
         # Response: {"output": [{"classes": [{"class": "ai_generated_audio", "value": 0.02}, ...]}]}
         classes = data["output"][0]["classes"]
@@ -68,5 +66,5 @@ async def check_deepfake(mulaw_bytes: bytes) -> dict:
             "is_deepfake": ai_score >= DEEPFAKE_THRESHOLD,
         }
     except Exception as e:
-        print(f"[deepfake] HiveAI error: {e}")
+        log.warning("Hive AI error: %s", e)
         return {"score": None, "is_deepfake": False}

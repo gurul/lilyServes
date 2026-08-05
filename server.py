@@ -1,318 +1,577 @@
+"""lilyServes — real-time call companion backend.
+
+Latency model: everything on the audio/transcript hot path is either
+sub-millisecond (heuristic scoring, WS pushes) or scheduled as a background
+task (LLM refinement, event extraction, deepfake check, DB writes via a
+worker thread). Nothing on the hot path ever awaits a network round-trip to
+an AI provider.
+"""
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
 
 load_dotenv()
 
-from deepfake_client import check_deepfake
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import PlainTextResponse
+
+import screening
+from auth import check_client_token, require_twilio_signature
+from call_state import CallSession, registry
+from config import settings
+from deepfake_client import check_deepfake, close_http
+from events import extract_events, has_event_trigger
 from google_transcriber import GoogleStreamingSession
+from hub import IMPORTANT, INFO, NOTABLE, URGENT, hub, push_activity
+from memory_store import MemoryStore, redact
 from scam_detector import analyze_scam
+from scam_heuristics import max_level, score_text
 from summarizer import generate_summary
 
-PORT = int(os.environ.get("PORT", 8000))
-FORWARD_TO = os.environ.get("FORWARD_TO", "+12067418265")
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("lily.server")
+
 DEEPFAKE_BUFFER_SIZE = 80_000  # ~10 seconds of mulaw audio at 8 kHz
 
-# ----- In-memory call state ------------------------------------------------
-# { call_sid: { stream_session, transcript, scam_score, client_ws } }
-calls: dict[str, dict] = {}
+store = MemoryStore(settings.data_dir, settings.retain_transcripts)
 
-# Clients waiting for a call to start (frontend connected before call arrives)
-pending_clients: list[WebSocket] = []
+# Keep strong references to fire-and-forget tasks (asyncio only holds weak ones).
+_background: set[asyncio.Task] = set()
 
 
-# ----- Lifespan: start ngrok and auto-configure Twilio webhook -------------
+def _spawn(coro) -> None:
+    task = asyncio.get_running_loop().create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+# ----- Lifespan --------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from pyngrok import ngrok
-    from twilio.rest import Client as TwilioClient
+    await store.open()
 
-    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    public_url = settings.public_url
+    tunnel = None
+    if not public_url and settings.ngrok_enabled:
+        from pyngrok import ngrok
 
-    tunnel = ngrok.connect(PORT, bind_tls=True)
-    public_url = tunnel.public_url
-    app.state.public_url = public_url
+        tunnel = ngrok.connect(settings.port, bind_tls=True)
+        public_url = tunnel.public_url
+    app.state.public_url = public_url or ""
 
-    print(f"\n{'='*60}")
-    print(f"  ngrok URL   : {public_url}")
-    print(f"  TwiML hook  : {public_url}/twiml")
-    print(f"  Client WS   : wss://{public_url.split('://', 1)[1]}/ws/client")
-    print(f"  Forwarding  : {FORWARD_TO}")
-    print(f"{'='*60}\n")
-
-    if account_sid and auth_token:
-        try:
-            twilio = TwilioClient(account_sid, auth_token)
-            numbers = twilio.incoming_phone_numbers.list(limit=1)
-            if numbers:
-                numbers[0].update(voice_url=public_url + "/twiml")
-                print(f"  Twilio webhook set on: {numbers[0].phone_number}\n")
-        except Exception as e:
-            print(f"  [warn] Could not auto-set Twilio webhook: {e}")
-            print(f"  Manually set: {public_url}/twiml\n")
+    if not settings.forward_to:
+        log.warning("FORWARD_TO unset — calls cannot be bridged until it is configured")
+    if not settings.client_token:
+        log.warning("CLIENT_TOKEN unset — dashboard access is unauthenticated (dev mode)")
+    if public_url:
+        log.info("public URL: %s (TwiML hook: %s/twiml)", public_url, public_url)
+        _configure_twilio_webhook(public_url)
     else:
-        print("  [warn] TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not set.")
-        print(f"  Manually set Twilio webhook to: {public_url}/twiml\n")
+        log.warning("no PUBLIC_URL and ngrok disabled — set the Twilio webhook manually")
 
     yield
 
-    ngrok.disconnect(public_url)
+    # Finalize any in-flight calls so summaries aren't lost on shutdown.
+    for session in registry.active():
+        try:
+            await _finalize_call(session.call_sid)
+        except Exception:
+            log.exception("finalize on shutdown failed for %s", session.call_sid)
+    if _background:
+        await asyncio.gather(*_background, return_exceptions=True)
+    await close_http()
+    await store.close()
+    if tunnel is not None:
+        from pyngrok import ngrok
+
+        ngrok.disconnect(tunnel.public_url)
+
+
+def _configure_twilio_webhook(public_url: str) -> None:
+    if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        log.warning("Twilio credentials unset — set the voice webhook manually: %s/twiml", public_url)
+        return
+    try:
+        from twilio.rest import Client as TwilioClient
+
+        twilio = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
+        numbers = twilio.incoming_phone_numbers.list(limit=1)
+        if numbers:
+            numbers[0].update(voice_url=public_url + "/twiml", voice_method="POST")
+            log.info("Twilio voice webhook set on %s", numbers[0].phone_number)
+    except Exception as e:
+        log.warning("could not auto-set Twilio webhook (%s) — set manually: %s/twiml", e, public_url)
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-# ----- /health --------------------------------------------------------------
+# ----- Auth dependency for dashboard REST ------------------------------------
+
+async def require_client_token(request: Request) -> None:
+    token = request.headers.get("X-Lily-Token", "") or request.query_params.get("token", "")
+    if not check_client_token(token):
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+# ----- Health ----------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "active_calls": len(calls)}
+    return {
+        "status": "ok",
+        "active_calls": len(registry),
+        "clients": hub.client_count,
+    }
 
 
-# ----- /twiml ---------------------------------------------------------------
+# ----- Twilio voice webhook: screening decision ------------------------------
+
+def _ws_url(request: Request) -> str:
+    base = request.app.state.public_url or str(request.base_url).rstrip("/")
+    return base.replace("https://", "wss://").replace("http://", "ws://")
+
 
 @app.post("/twiml")
-async def twiml(request: Request):
-    """
-    Return TwiML that:
-    1. Asynchronously streams caller audio to our WebSocket
-    2. Forwards (bridges) the call to FORWARD_TO
-    """
-    public_url = request.app.state.public_url
-    ws_url = public_url.replace("https://", "wss://").replace("http://", "ws://")
+async def twiml(request: Request, form: dict = Depends(require_twilio_signature)):
+    caller = form.get("From", "unknown")
+    call_sid = form.get("CallSid", "")
+    ctx = await store.caller_context(caller)
+    route = screening.decide_route(
+        caller, ctx, settings.trusted_numbers, settings.screen_unknown_callers
+    )
+    log.info("incoming call from %s -> %s", caller, route)
+    _spawn(store.touch_caller(caller))
 
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Start>
-    <Stream url="{ws_url}/ws/twilio" track="inbound_track" />
-  </Start>
-  <Dial>{FORWARD_TO}</Dial>
-</Response>"""
+    if route == screening.ROUTE_BLOCK:
+        _spawn(push_activity(
+            "stayed_safe",
+            "Blocked a known scam caller",
+            f"Lily declined a call from {caller} (repeat offender).",
+            IMPORTANT, call_sid, store,
+        ))
+        return PlainTextResponse(screening.twiml_reject(blocked=True), media_type="application/xml")
 
-    caller = (await request.form()).get("From", "unknown")
-    print(f"[twiml] Incoming call from {caller}")
+    if route == screening.ROUTE_SCREEN:
+        base = request.app.state.public_url or str(request.base_url).rstrip("/")
+        _spawn(push_activity(
+            "screening",
+            "Lily is screening a caller",
+            f"Unrecognized caller {caller} is being asked to identify themselves.",
+            INFO, call_sid, store,
+        ))
+        return PlainTextResponse(
+            screening.twiml_screen(base + "/screen/result"), media_type="application/xml"
+        )
+
+    xml = screening.twiml_pass(_ws_url(request), settings.forward_to, caller, screened=False)
     return PlainTextResponse(xml, media_type="application/xml")
 
 
-# ----- /ws/twilio -----------------------------------------------------------
+@app.post("/screen/result")
+async def screen_result(request: Request, form: dict = Depends(require_twilio_signature)):
+    caller = form.get("From", "unknown")
+    call_sid = form.get("CallSid", "")
+    speech = form.get("SpeechResult", "")
+    allow, reason = screening.assess_screen_answer(speech)
+    log.info("screen result for %s: allow=%s (%s)", caller, allow, reason)
+
+    if not allow:
+        _spawn(store.add_scam_strike(caller))
+        _spawn(push_activity(
+            "stayed_safe",
+            "Stayed safe",
+            f"Lily screened a caller ({caller}). {reason}. Call handled.",
+            IMPORTANT, call_sid, store,
+        ))
+        return PlainTextResponse(screening.twiml_reject(), media_type="application/xml")
+
+    _spawn(push_activity(
+        "screen_passed",
+        "Screened caller connected",
+        f"Caller said: “{redact(speech)}” — call connected and being monitored.",
+        INFO, call_sid, store,
+    ))
+    xml = screening.twiml_pass(_ws_url(request), settings.forward_to, caller, screened=True)
+    return PlainTextResponse(xml, media_type="application/xml")
+
+
+# ----- Twilio media stream ---------------------------------------------------
 
 @app.websocket("/ws/twilio")
 async def twilio_ws(websocket: WebSocket):
-    """Receive Twilio Media Stream events and process audio."""
     await websocket.accept()
     call_sid = None
-
     try:
         while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
+            msg = json.loads(await websocket.receive_text())
             event = msg.get("event")
 
-            if event == "connected":
-                pass  # no-op
-
-            elif event == "start":
-                call_sid = msg["start"]["callSid"]
-                print(f"[twilio_ws] Stream started — call_sid={call_sid}")
-
-                # Attach pending frontend client if available
-                client_ws = pending_clients.pop(0) if pending_clients else None
-
-                project_id = os.environ.get("PROJECT_ID", "heylily")
-
-                # Callback for final transcription results only
-                async def on_final(text: str, full_transcript: str, _sid=call_sid):
-                    state = calls.get(_sid)
-                    if not state:
-                        return
-                    state["transcript"].append(text)
-                    print(f"[transcript] {text}")
-
-                    scam = await analyze_scam(full_transcript, state["deepfake_score"])
-                    state["scam_level"] = scam["scam_level"]
-                    print(f"[scam] level={scam['scam_level']} reasoning={scam['reasoning']}")
-
-                    await _push_to_client(_sid, {
-                        "event": "transcript_update",
-                        "call_sid": _sid,
-                        "text": text,
-                        "full_transcript": full_transcript,
-                        "scam": scam,
-                    })
-
-                session = GoogleStreamingSession(
-                    project_id=project_id,
-                    on_final_result=on_final,
-                )
-
-                calls[call_sid] = {
-                    "stream_session": session,
-                    "transcript": [],
-                    "scam_level": "Low",
-                    "client_ws": client_ws,
-                    "deepfake_score": 0,
-                    "deepfake_buffer": bytearray(),
-                    "deepfake_submitted": False,
-                }
-
-                await session.start()
+            if event == "start":
+                start = msg["start"]
+                call_sid = start["callSid"]
+                params = start.get("customParameters") or {}
+                caller = params.get("caller") or "unknown"
+                screened = params.get("screened") == "1"
+                await _begin_call(call_sid, caller, screened)
 
             elif event == "media":
-                if call_sid and call_sid in calls:
+                session = registry.get(call_sid) if call_sid else None
+                if session is not None:
                     payload = base64.b64decode(msg["media"]["payload"])
-                    calls[call_sid]["stream_session"].feed_audio(payload)
-
-                    # Buffer first 10s of audio for deepfake detection (one-shot)
-                    state = calls[call_sid]
-                    if not state["deepfake_submitted"]:
-                        state["deepfake_buffer"] += payload
-                        if len(state["deepfake_buffer"]) >= DEEPFAKE_BUFFER_SIZE:
-                            state["deepfake_submitted"] = True
-                            buf = bytes(state["deepfake_buffer"][:DEEPFAKE_BUFFER_SIZE])
-                            state["deepfake_buffer"] = bytearray()  # free memory
-                            asyncio.create_task(_run_deepfake_check(call_sid, buf))
+                    session.stream_session.feed_audio(payload)
+                    if not session.deepfake_submitted:
+                        session.deepfake_buffer += payload
+                        if len(session.deepfake_buffer) >= DEEPFAKE_BUFFER_SIZE:
+                            session.deepfake_submitted = True
+                            buf = bytes(session.deepfake_buffer[:DEEPFAKE_BUFFER_SIZE])
+                            session.deepfake_buffer = bytearray()
+                            _spawn(_run_deepfake_check(call_sid, buf))
 
             elif event == "stop":
-                print(f"[twilio_ws] Stream stopped — call_sid={call_sid}")
-                if call_sid and call_sid in calls:
-                    await _finalize_call(call_sid)
+                log.info("stream stopped call_sid=%s", call_sid)
                 break
 
     except WebSocketDisconnect:
-        if call_sid and call_sid in calls:
+        pass
+    except Exception:
+        log.exception("twilio_ws error call_sid=%s", call_sid)
+    finally:
+        if call_sid and registry.get(call_sid):
             await _finalize_call(call_sid)
-    except Exception as e:
-        print(f"[twilio_ws] Error: {e}")
-        if call_sid and call_sid in calls:
-            await _finalize_call(call_sid)
 
 
-# ----- /ws/client -----------------------------------------------------------
+async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
+    log.info("stream started call_sid=%s caller=%s screened=%s", call_sid, caller, screened)
+    session = registry.create(call_sid, caller)
+    session.screened = screened
 
-@app.websocket("/ws/client")
-async def client_ws(websocket: WebSocket):
-    """
-    The Hey Lily frontend connects here to receive live call events.
-    If a call is already active, attaches immediately; otherwise waits.
-    """
-    await websocket.accept()
-    print("[client_ws] Frontend connected")
+    async def on_final(text: str, full_transcript: str, _sid=call_sid):
+        await _on_final_line(_sid, text, full_transcript)
 
-    # Attach to an active call if one exists
-    active_sid = next(iter(calls), None)
-    if active_sid:
-        calls[active_sid]["client_ws"] = websocket
-    else:
-        pending_clients.append(websocket)
+    async def on_interim(text: str, _sid=call_sid):
+        if settings.share_transcripts:
+            await hub.broadcast({
+                "event": "transcript_interim",
+                "call_sid": _sid,
+                "text": text,
+            })
 
-    try:
-        # Keep connection alive; frontend doesn't need to send messages
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        print("[client_ws] Frontend disconnected")
-        if websocket in pending_clients:
-            pending_clients.remove(websocket)
-        for state in calls.values():
-            if state["client_ws"] is websocket:
-                state["client_ws"] = None
+    session.stream_session = GoogleStreamingSession(
+        project_id=settings.project_id,
+        location=settings.stt_location,
+        model=settings.stt_model,
+        language_code=settings.stt_language,
+        on_final_result=on_final,
+        on_interim_result=on_interim,
+    )
+    await session.stream_session.start()
+
+    _spawn(store.record_call_start(call_sid, caller, screened))
+
+    # Cognitive continuity: give the dashboard gentle context about who this is.
+    ctx = await store.caller_context(caller)
+    await hub.broadcast({
+        "event": "call_started",
+        "call_sid": call_sid,
+        "caller": caller,
+        "screened": screened,
+        "caller_context": ctx,
+    }, NOTABLE)
 
 
-# ----- Core processing helpers ----------------------------------------------
-
-async def _push_to_client(call_sid: str, payload: dict):
-    state = calls.get(call_sid)
-    if not state:
+async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None:
+    """Hot path: heuristic score + immediate push, then async refinement."""
+    session = registry.get(call_sid)
+    if session is None:
         return
-    ws = state.get("client_ws")
-    if ws:
-        try:
-            await ws.send_text(json.dumps(payload))
-        except Exception:
-            state["client_ws"] = None
+    session.transcript.append(text)
+
+    heur = score_text(full_transcript)
+    session.scam_level = max_level(session.scam_level, heur.level)
+    session.heuristic_signals = heur.signals
+
+    payload = {
+        "event": "transcript_update",
+        "call_sid": call_sid,
+        "scam": {
+            "scam_level": session.scam_level,
+            "reasoning": session.scam_reasoning or ("Signals: " + ", ".join(heur.signals) if heur.signals else ""),
+            "signals": heur.signals,
+            "provisional": True,
+        },
+    }
+    if settings.share_transcripts:
+        payload["text"] = text
+        payload["full_transcript"] = full_transcript
+    await hub.broadcast(payload, INFO)
+
+    if heur.level == "High":
+        await _escalate_high_risk(session, "Signals: " + ", ".join(heur.signals))
+
+    _spawn(_refine_scam(call_sid))
+    if has_event_trigger(text):
+        _spawn(_capture_events(call_sid, text))
 
 
-async def _run_deepfake_check(call_sid: str, mulaw_bytes: bytes):
-    """One-shot deepfake detection on the first 10 seconds of audio."""
-    print(f"[deepfake] Checking {len(mulaw_bytes)} bytes for call_sid={call_sid}")
+async def _refine_scam(call_sid: str) -> None:
+    """LLM refinement, coalesced: one in flight per call, re-run once if new
+    lines arrived mid-analysis. Keeps LLM latency entirely off the hot path
+    and bounds cost on chatty calls."""
+    session = registry.get(call_sid)
+    if session is None:
+        return
+    if session.analysis_in_flight:
+        session.analysis_dirty = True
+        return
+    session.analysis_in_flight = True
+    try:
+        while True:
+            session.analysis_dirty = False
+            result = await analyze_scam(session.full_transcript, session.deepfake_score)
+            if registry.get(call_sid) is None:
+                return
+            previous = session.scam_level
+            session.scam_level = max_level(session.scam_level, result["scam_level"])
+            session.scam_reasoning = result["reasoning"]
+            await hub.broadcast({
+                "event": "scam_update",
+                "call_sid": call_sid,
+                "scam": {
+                    "scam_level": session.scam_level,
+                    "reasoning": session.scam_reasoning,
+                    "signals": result.get("signals", []),
+                    "provisional": False,
+                },
+            }, IMPORTANT if session.scam_level != "Low" and session.scam_level != previous else INFO)
+            if session.scam_level == "High":
+                await _escalate_high_risk(session, result["reasoning"])
+            if not session.analysis_dirty:
+                return
+    finally:
+        session.analysis_in_flight = False
+
+
+async def _escalate_high_risk(session: CallSession, reason: str) -> None:
+    """Urgent family notification (once per call) and optional intervention."""
+    if session.intervened:
+        return
+    session.intervened = True
+    _spawn(store.add_scam_strike(session.caller))
+    await push_activity(
+        "scam_alert",
+        "High scam risk on an active call",
+        f"Caller {session.caller}: {reason}",
+        URGENT, session.call_sid, store,
+    )
+    if settings.auto_intervene:
+        _spawn(_intervene(session.call_sid))
+
+
+async def _intervene(call_sid: str) -> None:
+    """Redirect the live call to a polite hangup (AUTO_INTERVENE=true only)."""
+    if not (settings.twilio_account_sid and settings.twilio_auth_token):
+        log.warning("AUTO_INTERVENE set but Twilio credentials missing")
+        return
+    try:
+        from twilio.rest import Client as TwilioClient
+
+        def _do():
+            twilio = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
+            twilio.calls(call_sid).update(twiml=screening.twiml_hangup_polite())
+
+        await asyncio.to_thread(_do)
+        log.info("intervened on call %s", call_sid)
+        await push_activity(
+            "intervened", "Lily ended a dangerous call",
+            "The call was ended automatically for safety.", URGENT, call_sid, store,
+        )
+    except Exception:
+        log.exception("intervention failed for %s", call_sid)
+
+
+async def _capture_events(call_sid: str, sentence: str) -> None:
+    """Active Assistance: turn a spoken commitment into a stored reminder."""
+    session = registry.get(call_sid)
+    caller = session.caller if session else "unknown"
+    for event in await extract_events(sentence):
+        event_id = await store.add_event(call_sid, caller, event["title"], event["when"])
+        title = event["title"] + (f" — {event['when']}" if event["when"] else "")
+        await push_activity(
+            "event_captured", "Event captured", title, NOTABLE, call_sid, store,
+        )
+        await hub.broadcast({
+            "event": "event_captured",
+            "call_sid": call_sid,
+            "id": event_id,
+            "title": event["title"],
+            "when": event["when"],
+        }, NOTABLE)
+
+
+async def _run_deepfake_check(call_sid: str, mulaw_bytes: bytes) -> None:
     result = await check_deepfake(mulaw_bytes)
-    print(f"[deepfake] Result: score={result['score']} is_deepfake={result['is_deepfake']}")
-
-    state = calls.get(call_sid)
-    if not state:
-        return  # call ended while we were waiting
-
+    session = registry.get(call_sid)
+    if session is None:
+        return
     if result["score"] is not None:
-        state["deepfake_score"] = result["score"]
-
-    await _push_to_client(call_sid, {
+        session.deepfake_score = result["score"]
+    await hub.broadcast({
         "event": "deepfake_result",
         "call_sid": call_sid,
         "deepfake_score": result["score"],
         "is_deepfake": result["is_deepfake"],
-    })
+    }, URGENT if result["is_deepfake"] else INFO)
+    if result["is_deepfake"]:
+        await push_activity(
+            "deepfake_alert", "Synthetic voice detected",
+            "The voice on this call appears to be AI-generated.",
+            URGENT, call_sid, store,
+        )
+        _spawn(_refine_scam(call_sid))
 
 
-async def _finalize_call(call_sid: str):
-    """Stop the streaming session, generate summary, clean up."""
-    state = calls.pop(call_sid, None)
-    if not state:
+async def _finalize_call(call_sid: str) -> None:
+    session = registry.pop(call_sid)
+    if session is None:
         return
 
-    # Stop Google streaming and get final transcript
-    session = state.get("stream_session")
-    if session:
-        transcript_lines = await session.stop()
-        state["transcript"] = transcript_lines
+    if session.stream_session is not None:
+        session.transcript = await session.stream_session.stop()
 
-    # If call ended before 10s, run deepfake check on whatever audio we have
-    if not state.get("deepfake_submitted") and len(state.get("deepfake_buffer", b"")) > 0:
-        buf = bytes(state["deepfake_buffer"])
-        print(f"[deepfake] Call ended early, checking {len(buf)} bytes")
-        result = await check_deepfake(buf)
-        print(f"[deepfake] Result: score={result['score']} is_deepfake={result['is_deepfake']}")
+    # Short call: run deepfake on whatever audio we have.
+    if not session.deepfake_submitted and session.deepfake_buffer:
+        result = await check_deepfake(bytes(session.deepfake_buffer))
         if result["score"] is not None:
-            state["deepfake_score"] = result["score"]
-        await _push_to_client_direct(state, {
-            "event": "deepfake_result",
-            "call_sid": call_sid,
-            "deepfake_score": result["score"],
-            "is_deepfake": result["is_deepfake"],
-        })
+            session.deepfake_score = result["score"]
 
-    # Generate GPT-4o summary
-    print(f"[summarizer] Generating summary for call_sid={call_sid} ...")
-    summary = await generate_summary(state["transcript"])
-    print(f"[summarizer] {summary}")
+    summary = await generate_summary(session.transcript)
+    final_level = max_level(session.scam_level, str(summary.get("risk_level", "low")).capitalize())
 
-    await _push_to_client_direct(state, {
+    _spawn(store.record_call_end(
+        call_sid, session.caller, final_level,
+        session.deepfake_score, summary, session.transcript,
+    ))
+    for event in summary.get("events", []):
+        if isinstance(event, dict) and event.get("title"):
+            _spawn(store.add_event(
+                call_sid, session.caller, str(event["title"]), str(event.get("when", ""))
+            ))
+
+    await hub.broadcast({
         "event": "call_summary",
         "call_sid": call_sid,
+        "caller": session.caller,
         "summary": summary,
-        "scam_level": state["scam_level"],
-        "deepfake_score": state["deepfake_score"],
-    })
+        "scam_level": final_level,
+        "deepfake_score": session.deepfake_score,
+    }, IMPORTANT if final_level != "Low" else NOTABLE)
+    await push_activity(
+        "call_ended",
+        "Call ended" + (f" — risk {final_level}" if final_level != "Low" else ""),
+        redact(str(summary.get("summary", ""))),
+        IMPORTANT if final_level != "Low" else INFO,
+        call_sid, store,
+    )
+    log.info("finalized call %s (risk=%s)", call_sid, final_level)
 
 
-async def _push_to_client_direct(state: dict, payload: dict):
-    ws = state.get("client_ws")
-    if ws:
-        try:
-            await ws.send_text(json.dumps(payload))
-        except Exception:
-            pass
+# ----- Dashboard WebSocket ---------------------------------------------------
+
+@app.websocket("/ws/client")
+async def client_ws(websocket: WebSocket):
+    token = websocket.query_params.get("token", "")
+    if not check_client_token(token):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    await hub.register(websocket)
+
+    # Snapshot so a client joining mid-call isn't blind.
+    try:
+        snapshot = {
+            "event": "snapshot",
+            "active_calls": [
+                {
+                    "call_sid": s.call_sid,
+                    "caller": s.caller,
+                    "scam_level": s.scam_level,
+                    "screened": s.screened,
+                    "deepfake_score": s.deepfake_score,
+                    **({"full_transcript": s.full_transcript} if settings.share_transcripts else {}),
+                }
+                for s in registry.active()
+            ],
+            "recent_activity": await store.recent_activity(20),
+            "open_events": await store.open_events(20),
+        }
+        await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
+        while True:
+            await websocket.receive_text()  # keepalive; client sends nothing meaningful
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await hub.unregister(websocket)
 
 
-# ----- Entry point ----------------------------------------------------------
+# ----- Dashboard REST --------------------------------------------------------
+
+@app.get("/api/activity", dependencies=[Depends(require_client_token)])
+async def api_activity(limit: int = 50):
+    return {"activity": await store.recent_activity(min(limit, 200))}
+
+
+@app.get("/api/events", dependencies=[Depends(require_client_token)])
+async def api_events():
+    return {"events": await store.open_events()}
+
+
+@app.post("/api/events/{event_id}/complete", dependencies=[Depends(require_client_token)])
+async def api_complete_event(event_id: int):
+    await store.complete_event(event_id)
+    return {"ok": True}
+
+
+@app.get("/api/calls", dependencies=[Depends(require_client_token)])
+async def api_calls(limit: int = 20):
+    return {"calls": await store.recent_calls(min(limit, 100))}
+
+
+@app.get("/api/caller/{number}", dependencies=[Depends(require_client_token)])
+async def api_caller(number: str):
+    return await store.caller_context(number)
+
+
+@app.post("/api/contacts/trusted", dependencies=[Depends(require_client_token)])
+async def api_set_trusted(payload: dict):
+    number = str(payload.get("number", "")).strip()
+    if not number:
+        raise HTTPException(status_code=422, detail="number required")
+    await store.set_trusted(number, bool(payload.get("trusted", True)), str(payload.get("name", "")))
+    return {"ok": True}
+
+
+# ----- Entry point -----------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=PORT, reload=False)
+
+    uvicorn.run("server:app", host="0.0.0.0", port=settings.port, reload=False)

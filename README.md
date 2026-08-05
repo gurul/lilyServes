@@ -1,45 +1,56 @@
 # lilyServes
 
-**Live scam detection for phone calls.** The real-time call-listening backend behind [heyLily](https://github.com/gurul/lilyWebsite), a gentle AI phone companion for older adults and the family who support them.
+**Live scam protection and call memory for phone calls.** The real-time backend behind [heyLily](https://github.com/gurul/lilyWebsite) — a gentle phone companion for older adults and people living with memory loss. Lily remembers your calls and screens out the scams.
 
-A scam call only works while it is happening. By the time a transcript is reviewed, or a family member hears about the gift cards, the money is gone. lilyServes listens to a call as it rings through — the caller's audio is streamed off Twilio, transcribed sentence by sentence, and rated for scam risk on every new sentence — so the warning arrives during the conversation rather than after it. The call itself is untouched: the stream is forked, the phone still rings, and the person on the line talks to whoever called them.
+A scam call only works while it is happening. By the time a transcript is reviewed, or a family member hears about the gift cards, the money is gone. lilyServes sits between the phone and the outside world: unknown callers are screened before the phone ever rings, every bridged call is transcribed and risk-scored sentence by sentence, a synthetic-voice check runs on the first seconds of audio, and the family dashboard hears about it live — during the conversation, not after it.
 
-Alongside the transcript it checks whether the voice on the line is real. The first ten seconds of audio go to Hive AI's deepfake detector, which matters for the grandparent scam in its current form: a cloned voice saying it is your grandson, in trouble, needing money now. A synthetic voice cannot lower the risk score, only raise it.
+## Features
 
-## What it does
+- **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. Repeat scammers are blocked outright. Every screen shows up on the dashboard as a *Stayed safe* event.
+- **Live scam detection, two tiers.** A sub-millisecond heuristic engine (gift cards, wire transfers, urgency, secrecy, grandparent-scam patterns, remote-access requests, verification-code requests, …) scores every sentence instantly; an LLM refines the assessment asynchronously over a rolling window. The displayed risk level is monotonic — it can only escalate during a call.
+- **Deepfake detection.** The first ~10 seconds of caller audio go to Hive AI. A synthetic voice floors the risk at Medium, raises an urgent alert, and can never *lower* a score.
+- **Cognitive continuity.** SQLite-backed caller memory: who called, how often, what the last call was about, open commitments. When a call starts, the dashboard receives gentle context about the caller — bridging the gaps for someone living with memory changes.
+- **Event capture (Active Assistance).** "Main St. Pharmacy confirmed pickup for Friday @ 4:00 PM" becomes a structured reminder, extracted mid-call and pushed to the dashboard as an *Event captured* item. Post-call summaries also sweep for missed commitments.
+- **Family dashboard, smart updates.** Any number of clients connect over WebSocket and get a full snapshot plus live events. Every item carries an importance level (`info` / `notable` / `important` / `urgent`); only `important+` is flagged `notify: true` — peace of mind, not surveillance.
+- **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored passes through redaction that scrubs card numbers, SSNs, and one-time codes.
+- **Optional intervention.** With `AUTO_INTERVENE=true`, a call that reaches High risk is redirected to a polite hangup via the Twilio REST API. Off by default — warn, don't act.
 
-1. **Answers the call.** Twilio hits `/twiml`, which returns TwiML that forks the caller's audio to a WebSocket and dials the real destination in the same breath.
-2. **Streams the audio.** `/ws/twilio` receives base64 mulaw frames, 8 kHz mono, as Twilio's media stream produces them.
-3. **Transcribes continuously.** Google Speech-to-Text V2 runs a bidirectional gRPC stream with the `telephony` model, emitting interim and final results and silently reconnecting before Google's ~5 minute per-stream limit.
-4. **Scores every sentence.** Each final transcript line triggers `gpt-4o-mini` over the full transcript so far, returning `Low` / `Medium` / `High` with a one-line reason.
-5. **Checks the voice is human.** The first ~10 seconds (80,000 mulaw bytes) are converted to WAV and sent once to Hive AI. A deepfake score at or above `0.5` floors the risk at `Medium`.
-6. **Pushes to the frontend.** Every transcript line, score, and deepfake verdict goes out over `/ws/client` as it happens.
-7. **Summarizes on hangup.** `gpt-4o` produces a structured post-call JSON: summary, scam indicators, risk level, recommended action.
+## Latency model
+
+Nothing on the audio/transcript hot path awaits an AI provider:
+
+1. Twilio media frames are fed to Google STT through a bounded queue (drop-oldest under stall, so live latency beats completeness).
+2. Each final sentence is heuristic-scored inline (<1 ms) and pushed to the dashboard immediately, marked `provisional`.
+3. LLM refinement runs as a background task, **coalesced** — one analysis in flight per call; lines arriving mid-flight trigger exactly one re-run. Cost and tail latency stay flat on long calls (rolling 4k-char window, `max_tokens` capped, JSON mode).
+4. Deepfake checks, event extraction, and all SQLite writes run off-loop (background tasks / worker thread, WAL mode).
+5. Dashboard broadcasts serialize the payload once and fan out concurrently; interim (non-final) transcript fragments are streamed too, so text appears as it's spoken.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     A[Caller] --> B[Twilio Voice]
-    B --> C[POST /twiml]
-    C --> D[Dial: forwards to recipient]
-    C --> E[Start Stream: forks caller audio]
-    E --> F[WS /ws/twilio<br/>mulaw 8kHz]
-    F --> G[Google STT V2<br/>telephony, streaming]
-    F --> H[First 10s buffer]
-    H --> I[Hive AI<br/>deepfake score]
-    G -->|final result| J[gpt-4o-mini<br/>scam level]
-    I --> J
-    J --> K[WS /ws/client]
-    G -->|call ends| L[gpt-4o<br/>structured summary]
-    L --> K
+    B --> C[POST /twiml<br/>signature-validated]
+    C -->|trusted / known| D[Bridge + fork audio]
+    C -->|unknown / restricted| S[Lily screens:<br/>Gather speech]
+    C -->|repeat scammer| X[Blocked]
+    S -->|answer OK| D
+    S -->|scam patterns / silence| X
+    D --> F[WS /ws/twilio<br/>mulaw 8kHz]
+    F --> G[Google STT V2 streaming]
+    F --> H[First 10s] --> I[Hive AI deepfake]
+    G -->|each sentence| J[Heuristics <1ms<br/>instant push]
+    J -.->|background| K[LLM refine<br/>coalesced]
+    G -->|commitment trigger| E[Event extraction]
+    G -->|hangup| L[Structured summary]
+    J & K & I & E & L --> M[ClientHub<br/>WS fan-out + importance]
+    E & L --> N[(SQLite memory<br/>callers · calls · events · activity)]
+    N -->|caller context| M
 ```
-
-Call state lives in a plain in-memory dict keyed by Twilio `callSid`; there is no database and nothing is persisted after the call ends. Deepfake detection runs as a detached task so a slow Hive response never stalls transcription. Only `inbound_track` is streamed, so the transcript is the caller's side of the conversation.
 
 ## Quick start
 
-Requires **Python 3.9–3.12** (the `audioop` module used for mulaw conversion was removed in 3.13), an [ngrok](https://ngrok.com) account, a Twilio number, a Google Cloud project with the Speech-to-Text API enabled, and an OpenAI key.
+Requires Python 3.9+ (3.13 supported — mulaw decode has a pure-Python fallback), a Twilio number, a Google Cloud project with Speech-to-Text enabled, an OpenAI key, and [ngrok](https://ngrok.com) for local development.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -47,70 +58,99 @@ pip install -r requirements.txt
 
 gcloud auth application-default login    # or export GOOGLE_APPLICATION_CREDENTIALS
 
-cp .env.example .env                     # then fill in the values below
+cp .env.example .env                     # fill in the values
 python server.py
 ```
 
-On boot the server opens an ngrok tunnel, prints the public URL, and — if Twilio credentials are present — points your first Twilio number's voice webhook at `<public_url>/twiml` automatically. Without them it prints the URL to paste into the Twilio console by hand.
+On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — if Twilio credentials are present — points your Twilio number's voice webhook at `<public_url>/twiml`. Connect a dashboard to `wss://<public_url>/ws/client?token=<CLIENT_TOKEN>`, then call the number.
 
-Connect the frontend to `wss://<public_url>/ws/client`, then call the Twilio number. A client that connects before the call arrives is queued and attached when the stream starts.
+### Tests & lint
+
+```bash
+pip install -r requirements-dev.txt
+pytest          # 37 tests: heuristics, screening, memory/redaction, audio, auth
+ruff check .
+```
 
 ## Configuration
 
-Credentials belong in `.env`, which is gitignored. Never commit API keys.
+All configuration is environment variables (see `.env.example` for the full annotated list). Credentials belong in `.env`, which is gitignored — never commit keys.
 
 | Variable | Required | Purpose |
 |---|---:|---|
-| `OPENAI_API_KEY` | Yes | Scam scoring (`gpt-4o-mini`) and call summary (`gpt-4o`) |
-| `PROJECT_ID` | Yes | Google Cloud project for Speech-to-Text V2. Defaults to `heylily` |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Yes | Service-account JSON path, unless you use `gcloud` ADC |
-| `TWILIO_ACCOUNT_SID` | No | Auto-configures the voice webhook on boot. Without it, set the webhook manually |
-| `TWILIO_AUTH_TOKEN` | No | Pairs with the SID above |
-| `HIVE_API_SECRET` | No | Hive AI deepfake detection. Without it the check is skipped and scoring runs on transcript alone |
-| `FORWARD_TO` | No | Number the call is bridged to. Defaults to a demo number — set this |
-| `PORT` | No | Server port, defaults to `8000` |
+| `OPENAI_API_KEY` | Yes | Scam scoring, event extraction, summaries |
+| `PROJECT_ID` | Yes | Google Cloud project for Speech-to-Text V2 |
+| `FORWARD_TO` | Yes | Number calls are bridged to |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | Recommended | Webhook auto-config **and webhook signature validation** — without the token, webhooks are unauthenticated (dev only) |
+| `CLIENT_TOKEN` | Recommended | Shared secret for the dashboard WS + REST; unset = open (dev only) |
+| `SCREEN_UNKNOWN_CALLERS` | No | Default `true` — Lily answers unknown callers first |
+| `TRUSTED_NUMBERS` | No | Comma-separated allowlist that always rings through |
+| `HIVE_API_SECRET` | No | Deepfake detection; skipped if unset |
+| `AUTO_INTERVENE` | No | Default `false` — hang up High-risk calls automatically |
+| `RETAIN_TRANSCRIPTS` / `SHARE_TRANSCRIPTS` | No | Privacy controls (persist / stream transcript text) |
+| `PUBLIC_URL`, `NGROK_ENABLED`, `PORT`, `DATA_DIR`, `LOG_LEVEL` | No | Deployment knobs |
+| `SCAM_MODEL`, `SUMMARY_MODEL`, `EVENT_MODEL` | No | Model overrides |
 
 ## Endpoints
 
-| Route | Kind | Purpose |
-|---|---|---|
-| `POST /twiml` | HTTP | Twilio voice webhook. Returns TwiML that forks audio and dials `FORWARD_TO` |
-| `GET /health` | HTTP | Liveness plus active call count |
-| `/ws/twilio` | WebSocket | Twilio Media Streams ingress: `connected`, `start`, `media`, `stop` |
-| `/ws/client` | WebSocket | Frontend egress. Send nothing; receive the events below |
+| Route | Kind | Auth | Purpose |
+|---|---|---|---|
+| `POST /twiml` | HTTP | Twilio signature | Voice webhook: screening decision → bridge / screen / block |
+| `POST /screen/result` | HTTP | Twilio signature | Screening answer assessment → bridge or decline |
+| `GET /health` | HTTP | — | Liveness, active calls, connected clients |
+| `/ws/twilio` | WebSocket | — | Twilio Media Streams ingress |
+| `/ws/client` | WebSocket | `?token=` | Dashboard egress: snapshot on connect, then live events |
+| `GET /api/activity` · `/api/events` · `/api/calls` · `/api/caller/{number}` | HTTP | token | Activity feed, open reminders, call history, caller context |
+| `POST /api/events/{id}/complete` | HTTP | token | Mark a reminder done |
+| `POST /api/contacts/trusted` | HTTP | token | Add/remove a trusted contact |
 
-Events pushed to `/ws/client`:
+Events pushed on `/ws/client` (all carry `importance` and `notify`):
 
-| `event` | When | Payload |
-|---|---|---|
-| `transcript_update` | Every final transcript line | `text`, `full_transcript`, `scam: {scam_level, reasoning}` |
-| `deepfake_result` | Once, ~10s in (or at hangup if the call is shorter) | `deepfake_score`, `is_deepfake` |
-| `call_summary` | On hangup | `summary` (JSON string), `scam_level`, `deepfake_score` |
-
-All three also carry `call_sid`.
+| `event` | When |
+|---|---|
+| `snapshot` | On connect: active calls, recent activity, open events |
+| `call_started` | Stream starts — includes `caller_context` (name, history, open commitments) |
+| `transcript_interim` / `transcript_update` | As words are spoken / each final sentence (instant provisional risk) |
+| `scam_update` | LLM-refined risk level |
+| `deepfake_result` | Once, ~10 s in |
+| `event_captured` | A commitment was extracted mid-call |
+| `activity` | Feed items: *Stayed safe*, *Event captured*, screening, alerts |
+| `call_summary` | On hangup: structured summary, indicators, recommended action |
 
 ## Project layout
 
 | Path | What |
 |---|---|
-| `server.py` | FastAPI app: TwiML, both WebSockets, call state, lifespan ngrok + Twilio wiring |
-| `google_transcriber.py` | `GoogleStreamingSession` — STT V2 bidirectional stream, chunking, reconnect-before-timeout |
-| `scam_detector.py` | Per-sentence `Low`/`Medium`/`High` scoring, with deepfake escalation |
-| `deepfake_client.py` | mulaw → WAV conversion and the Hive AI call |
-| `summarizer.py` | Shared OpenAI client and the post-call structured summary |
-| `transcriber.py` | Legacy Whisper transcription, superseded by `google_transcriber.py`. Unused and non-functional |
-| `assets/` | Press image from the PSL pitch |
+| `server.py` | FastAPI app: webhooks, both WebSockets, hot-path orchestration, dashboard REST |
+| `screening.py` | Screening routes, answer assessment, all TwiML builders |
+| `scam_heuristics.py` | Instant regex risk engine (16 weighted patterns) |
+| `scam_detector.py` | LLM refinement over a rolling window, deepfake/heuristic floors |
+| `events.py` | Commitment extraction with a cheap trigger gate |
+| `memory_store.py` | SQLite (WAL) caller memory, calls, events, activity; redaction |
+| `google_transcriber.py` | STT V2 bidirectional stream, bounded queue, reconnect-before-timeout |
+| `deepfake_client.py` | Hive AI call over a warm pooled connection |
+| `summarizer.py` | Shared OpenAI client, structured post-call summary |
+| `hub.py` | Dashboard fan-out + importance/notification tagging |
+| `call_state.py` | Multi-call registry and per-call session state |
+| `auth.py` | Twilio signature validation, dashboard token check |
+| `audio.py` | mulaw → WAV, pure-Python fallback for 3.13+ |
+| `config.py` | Env-driven settings |
+| `tests/` | 37 unit tests (no network required) |
+
+## Security & privacy posture
+
+- Twilio webhooks are HMAC-validated (`X-Twilio-Signature`) whenever `TWILIO_AUTH_TOKEN` is set; unset is loudly logged as dev mode.
+- Dashboard WS and REST require `CLIENT_TOKEN` (constant-time compare); unset is loudly logged as dev mode.
+- Minimal retention by default: no transcript persistence, summaries only, all stored text redacted (cards / SSNs / one-time codes).
+- No phone numbers or secrets in source; everything comes from the environment.
 
 ## Known limitations
 
-This is demo-stage code, shaped by a live pitch rather than production traffic.
-
-- State is in-memory and single-process. Restarting drops every active call.
-- `/ws/client` has no authentication and pairs first-come with whichever call starts next, so it assumes one call and one viewer at a time.
-- Only the inbound track is transcribed. The recipient's replies are not in the transcript.
-- ngrok is started unconditionally in the app lifespan, which is convenient for demos and wrong for a deployed service.
-- Scam scoring re-sends the full transcript on every final line, so cost grows with call length.
+- Call state is in-memory and single-process (SQLite memory survives restarts; in-flight calls do not).
+- Only the caller's inbound track is transcribed; the recipient's replies are not analyzed.
+- Screening uses heuristics only on the spoken answer — a calm, novel scam opening will get bridged (and then caught by live scoring).
+- The dashboard is a protocol, not a UI — the heyLily frontend consumes it.
 
 ## Built with
 
-FastAPI, Twilio Voice and Media Streams, Google Cloud Speech-to-Text V2, OpenAI `gpt-4o` / `gpt-4o-mini`, Hive AI deepfake detection, and ngrok.
+FastAPI, Twilio Voice + Media Streams, Google Cloud Speech-to-Text V2, OpenAI, Hive AI, SQLite, and ngrok.

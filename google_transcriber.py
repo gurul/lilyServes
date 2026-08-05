@@ -1,15 +1,25 @@
+from __future__ import annotations
+
 import asyncio
+import logging
 import time
-from typing import AsyncIterator, Awaitable, Callable, Optional
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from google.cloud.speech_v2 import SpeechAsyncClient
 from google.cloud.speech_v2.types import cloud_speech
+
+log = logging.getLogger("lily.stt")
 
 # Reconnect before Google's ~5 minute streaming limit
 STREAM_TIME_LIMIT_SECONDS = 290
 
 # Google limits each request's audio field to 25600 bytes
 MAX_AUDIO_CHUNK_BYTES = 25600
+
+# Backpressure bound: Twilio sends ~50 frames/s (20ms mulaw), so 512 frames
+# is ~10s of audio. If the stream stalls longer than that we drop the oldest
+# audio rather than grow memory without bound.
+AUDIO_QUEUE_MAX = 512
 
 
 class GoogleStreamingSession:
@@ -27,8 +37,8 @@ class GoogleStreamingSession:
         location: str = "global",
         model: str = "telephony",
         language_code: str = "en-US",
-        on_interim_result: Optional[Callable[[str], Awaitable[None]]] = None,
-        on_final_result: Optional[Callable[[str, str], Awaitable[None]]] = None,
+        on_interim_result: Callable[[str], Awaitable[None]] | None = None,
+        on_final_result: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self._project_id = project_id
         self._location = location
@@ -37,11 +47,11 @@ class GoogleStreamingSession:
         self._on_interim_result = on_interim_result  # callback(interim_text)
         self._on_final_result = on_final_result      # callback(final_text, full_transcript)
 
-        self._client: Optional[SpeechAsyncClient] = None
-        self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._client: SpeechAsyncClient | None = None
+        self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=AUDIO_QUEUE_MAX)
         self._running_transcript: list[str] = []
         self._is_running = False
-        self._stream_task: Optional[asyncio.Task] = None
+        self._stream_task: asyncio.Task | None = None
 
     @property
     def running_transcript(self) -> list[str]:
@@ -131,13 +141,13 @@ class GoogleStreamingSession:
             except Exception as e:
                 if not self._is_running:
                     break
-                print(f"[google_transcriber] Stream error: {e}, reconnecting...")
+                log.warning("stream error: %s — reconnecting", e)
                 await asyncio.sleep(0.5)
                 continue
 
             if not self._is_running:
                 break
-            print("[google_transcriber] Reconnecting stream (time limit)...")
+            log.info("reconnecting stream before time limit")
 
     async def start(self) -> None:
         """Start the streaming session."""
@@ -145,14 +155,33 @@ class GoogleStreamingSession:
         self._stream_task = asyncio.create_task(self._run_stream_loop())
 
     def feed_audio(self, mulaw_bytes: bytes) -> None:
-        """Feed raw mulaw audio bytes into the session. Non-blocking."""
-        if self._is_running:
+        """Feed raw mulaw audio bytes into the session. Non-blocking.
+
+        If the queue is full (stalled stream), the oldest audio is dropped so
+        live latency is preserved over completeness.
+        """
+        if not self._is_running:
+            return
+        try:
             self._audio_queue.put_nowait(mulaw_bytes)
+        except asyncio.QueueFull:
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._audio_queue.put_nowait(mulaw_bytes)
+            except asyncio.QueueFull:
+                pass
+            log.warning("audio queue full — dropped oldest frame")
 
     async def stop(self) -> list[str]:
         """Stop the session and return the full transcript."""
         self._is_running = False
-        self._audio_queue.put_nowait(None)  # Unblock the generator
+        try:
+            self._audio_queue.put_nowait(None)  # Unblock the generator
+        except asyncio.QueueFull:
+            pass  # generator will exit via _is_running on next timeout
         if self._stream_task:
             try:
                 await asyncio.wait_for(self._stream_task, timeout=5.0)
