@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from risk_fusion import RiskFusion
+
 
 @dataclass
 class CallSession:
@@ -16,6 +18,7 @@ class CallSession:
     scam_level: str = "Low"
     scam_reasoning: str = ""
     heuristic_signals: list[str] = field(default_factory=list)
+    fusion: RiskFusion = field(default_factory=RiskFusion)
     deepfake_score: float | None = None
     deepfake_buffer: bytearray = field(default_factory=bytearray)
     deepfake_submitted: bool = False

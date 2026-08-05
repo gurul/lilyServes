@@ -325,14 +325,17 @@ async def _recall_caller_memories(call_sid: str, caller: str, name: str) -> None
 
 
 async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None:
-    """Hot path: heuristic score + immediate push, then async refinement."""
+    """Hot path: heuristics + EWMA fusion + immediate push, then async refinement."""
     session = registry.get(call_sid)
     if session is None:
         return
     session.transcript.append(text)
 
+    # Cumulative heuristics feed the EWMA fusion; the regex tier escalates
+    # but never clears (displayed level stays monotonic per call).
     heur = score_text(full_transcript)
-    session.scam_level = max_level(session.scam_level, heur.level)
+    state = session.fusion.on_sentence(heur)
+    session.scam_level = max_level(session.scam_level, heur.level, state.level)
     session.heuristic_signals = heur.signals
 
     payload = {
@@ -342,6 +345,8 @@ async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None
             "scam_level": session.scam_level,
             "reasoning": session.scam_reasoning or ("Signals: " + ", ".join(heur.signals) if heur.signals else ""),
             "signals": heur.signals,
+            "risk_score": state.score,
+            "stage": state.stage,
             "provisional": True,
         },
     }
@@ -350,7 +355,9 @@ async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None
         payload["full_transcript"] = full_transcript
     await hub.broadcast(payload, INFO)
 
-    if heur.level == "High":
+    # Payment-stage markers and theta-2 fire immediately — scam-progression
+    # research shows 1-2 turns of lead time once payment language appears.
+    if state.hard_alert or heur.level == "High":
         await _escalate_high_risk(session, "Signals: " + ", ".join(heur.signals))
 
     _spawn(_refine_scam(call_sid))
@@ -372,23 +379,28 @@ async def _refine_scam(call_sid: str) -> None:
     try:
         while True:
             session.analysis_dirty = False
-            result = await analyze_scam(session.full_transcript, session.deepfake_score)
+            result = await analyze_scam(session.full_transcript)
             if registry.get(call_sid) is None:
                 return
             previous = session.scam_level
-            session.scam_level = max_level(session.scam_level, result["scam_level"])
+            state = session.fusion.on_llm(result["verdict"])
+            session.scam_level = max_level(session.scam_level, state.level)
             session.scam_reasoning = result["reasoning"]
             await hub.broadcast({
                 "event": "scam_update",
                 "call_sid": call_sid,
                 "scam": {
                     "scam_level": session.scam_level,
+                    "verdict": result["verdict"],
+                    "criteria": result.get("criteria", []),
                     "reasoning": session.scam_reasoning,
                     "signals": result.get("signals", []),
+                    "risk_score": state.score,
+                    "stage": state.stage,
                     "provisional": False,
                 },
             }, IMPORTANT if session.scam_level != "Low" and session.scam_level != previous else INFO)
-            if session.scam_level == "High":
+            if state.hard_alert:
                 await _escalate_high_risk(session, result["reasoning"])
             if not session.analysis_dirty:
                 return
@@ -461,17 +473,23 @@ async def _run_deepfake_check(call_sid: str, mulaw_bytes: bytes) -> None:
         return
     if result["score"] is not None:
         session.deepfake_score = result["score"]
+        session.fusion.on_deepfake(result["score"])
     await hub.broadcast({
         "event": "deepfake_result",
         "call_sid": call_sid,
         "deepfake_score": result["score"],
         "is_deepfake": result["is_deepfake"],
-    }, URGENT if result["is_deepfake"] else INFO)
+    }, IMPORTANT if result["is_deepfake"] else INFO)
     if result["is_deepfake"]:
+        # Narrowband telephony blunts deepfake detectors, so a synthetic-voice
+        # score multiplies transcript risk in fusion rather than alarming
+        # alone; it only reads URGENT when the transcript is also risky.
+        elevated = session.scam_level != "Low"
         await push_activity(
-            "deepfake_alert", "Synthetic voice detected",
-            "The voice on this call appears to be AI-generated.",
-            URGENT, call_sid, store,
+            "deepfake_alert", "Synthetic voice suspected",
+            "The voice on this call may be AI-generated."
+            + (" Combined with the conversation, this call looks dangerous." if elevated else ""),
+            URGENT if elevated else IMPORTANT, call_sid, store,
         )
         _spawn(_refine_scam(call_sid))
 
