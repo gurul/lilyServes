@@ -1,6 +1,16 @@
 # lilyServes
 
-**Live scam protection and call memory for phone calls.** The real-time backend behind [heyLily](https://github.com/gurul/lilyWebsite) — a gentle phone companion for older adults and people living with memory loss. Lily remembers your calls and screens out the scams.
+<p align="center">
+  <a href="https://heylily.vercel.app"><img src="assets/heylily-hero.png" alt="heyLily — the quiet way to stay independent. A gentle phone companion for older adults and people living with memory loss, screening a restricted number with the option to let Lily answer first" width="100%"></a>
+</p>
+
+<p align="center">
+  <b>▶ Try the demo — <a href="https://heylily.vercel.app">heylily.vercel.app</a></b>
+  <br>
+  <sub>Site source: <a href="https://github.com/gurul/lilyWebsite">gurul/lilyWebsite</a></sub>
+</p>
+
+**Live scam protection and call memory for phone calls.** The real-time backend behind [heyLily](https://heylily.vercel.app) — a gentle phone companion for older adults and people living with memory loss. Lily remembers your calls and screens out the scams.
 
 A scam call only works while it is happening. By the time a transcript is reviewed, or a family member hears about the gift cards, the money is gone. lilyServes sits between the phone and the outside world: unknown callers are screened before the phone ever rings, every bridged call is transcribed and risk-scored sentence by sentence, a synthetic-voice check runs on the first seconds of audio, and the family dashboard hears about it live — during the conversation, not after it.
 
