@@ -301,6 +301,33 @@ class MemoryStore:
 
         return await self._run(q)
 
+    async def complete_event_by_memory(self, memory_id: str) -> None:
+        """Close the event twin(s) of a commitment memory retired by the
+        lifecycle layer (superseded by a reschedule, completed, expired)."""
+        if not memory_id:
+            return
+
+        def w(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE events SET done = 1 WHERE memory_id = ? AND done = 0", (memory_id,)
+            )
+            conn.commit()
+
+        await self._run(w)
+
+    async def remap_event_memory(self, from_id: str, to_id: str) -> None:
+        """Repoint event links after a duplicate memory merged into a survivor."""
+        if not from_id:
+            return
+
+        def w(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE events SET memory_id = ? WHERE memory_id = ?", (to_id, from_id)
+            )
+            conn.commit()
+
+        await self._run(w)
+
     async def complete_event(self, event_id: int) -> str:
         """Mark an event done. Returns the linked memory id ('' if none) so
         the caller can retire the COMMITMENT memory twin."""
