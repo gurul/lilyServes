@@ -19,7 +19,9 @@ A scam call only works while it is happening. By the time a transcript is review
 - **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. Repeat scammers are blocked outright. Every screen shows up on the dashboard as a *Stayed safe* event.
 - **Live scam detection, research-grounded.** A sub-millisecond heuristic engine (gift cards, wire transfers, urgency, secrecy, grandparent-scam patterns, remote-access requests, verification-code requests, …) scores every sentence instantly; a criteria-rubric LLM tier delivers an authoritative scam / uncertain / safe verdict asynchronously. Signals fuse through an EWMA accumulator with dual thresholds, payment-stage language escalates immediately, and the displayed risk level is monotonic — it can only escalate during a call (citations below).
 - **Deepfake detection.** The first ~10 seconds of caller audio go to Hive AI. A synthetic voice multiplies the transcript risk and alerts the family — urgently when the conversation is also suspicious — and can never *lower* a score.
-- **Cognitive continuity — lilyMemory.** A purpose-built long-term memory engine. Every call, commitment, trusted contact, and scam encounter becomes a typed memory (`episode` / `commitment` / `person` / `preference` / `win` / `safety`) with importance, confidence, entities, and topics. Recall is hybrid — semantic (embeddings + cosine) fused with lexical (FTS5 BM25), importance, and recency — so when a call starts the dashboard receives genuinely related context about the caller, bridging the gaps for someone living with memory changes. Alongside it, a structured SQLite store tracks caller history, trust, and scam strikes.
+- **Cognitive continuity — lilyMemory.** A purpose-built long-term memory engine. Every call, commitment, trusted contact, extracted fact, and scam encounter becomes a typed memory (`episode` / `commitment` / `person` / `preference` / `win` / `safety`) with importance, confidence, entities, and topics. Recall is hybrid — semantic (embeddings + cosine) fused with lexical (entity-weighted FTS5 BM25), gated on relevance, shaded by type-aware recency, and MMR-diversified so near-duplicates never crowd the results. Alongside it, a structured SQLite store tracks caller history, trust, and scam strikes.
+- **A memory lifecycle that keeps memory honest.** Repeated observations *reinforce* the existing memory instead of duplicating it; a changed fact ("pickup moved to Saturday") *supersedes* the old one, which stays auditable but stops surfacing; commitments resolve their "Friday at 4 PM" into a real due date and *expire* after it passes (completing the reminder retires the memory too); low-importance chatter fades out while scam history never expires. All deterministic — no extra LLM calls — and `forget()` is always a hard delete.
+- **Caller profile card.** When the phone rings the dashboard instantly receives a structured card — stable facts, open commitments (soonest due first), recent moments, and the caller's scam record — assembled in one SQL query, no model round-trip, plus a compact rendering ready for prompt injection. Post-call, durable facts (who people are, how the user likes things done, wins worth celebrating) are extracted by the *same* LLM call that writes the summary.
 - **Event capture (Active Assistance).** "Main St. Pharmacy confirmed pickup for Friday @ 4:00 PM" becomes a structured reminder, extracted mid-call and pushed to the dashboard as an *Event captured* item. Post-call summaries also sweep for missed commitments.
 - **Family dashboard, smart updates.** Any number of clients connect over WebSocket and get a full snapshot plus live events. Every item carries an importance level (`info` / `notable` / `important` / `urgent`); only `important+` is flagged `notify: true` — peace of mind, not surveillance.
 - **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored — including every memory — passes through redaction that scrubs card numbers, SSNs, and one-time codes, and any memory can be deleted via the API (`DELETE /api/memories/{id}`). You own your data, always. `MEMORY_EMBEDDINGS=false` keeps memory fully offline (lexical recall only).
@@ -78,7 +80,7 @@ On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — i
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 53 tests: heuristics, fusion, screening, memory, audio, auth
+pytest          # 90+ tests: heuristics, fusion, screening, memory, lifecycle, audio, auth
 ruff check .
 ```
 
@@ -110,19 +112,22 @@ All configuration is environment variables (see `.env.example` for the full anno
 | `GET /health` | HTTP | — | Liveness, active calls, connected clients |
 | `/ws/twilio` | WebSocket | — | Twilio Media Streams ingress |
 | `/ws/client` | WebSocket | `?token=` | Dashboard egress: snapshot on connect, then live events |
-| `GET /api/activity` · `/api/events` · `/api/calls` · `/api/caller/{number}` | HTTP | token | Activity feed, open reminders, call history, caller context |
-| `POST /api/events/{id}/complete` | HTTP | token | Mark a reminder done |
-| `POST /api/contacts/trusted` | HTTP | token | Add/remove a trusted contact (also remembered as a `person` memory) |
-| `GET /api/memories` · `GET /api/memories/search?q=` | HTTP | token | Browse / hybrid-search long-term memories |
+| `GET /api/activity` · `/api/events` · `/api/calls` | HTTP | token | Activity feed, open reminders, call history |
+| `GET /api/caller/{number}` | HTTP | token | Caller context + instant memory profile card |
+| `POST /api/events/{id}/complete` | HTTP | token | Mark a reminder done (also retires its commitment memory) |
+| `POST /api/contacts/trusted` | HTTP | token | Add/remove a trusted contact (name + optional note become a `person` memory; re-trusting replaces the old fact) |
+| `GET /api/memories` · `GET /api/memories/search?q=` | HTTP | token | Browse / hybrid-search memories; `include_inactive=true` shows the superseded/expired audit trail |
+| `POST /api/memories` | HTTP | token | Family write path — add a preference or note directly |
 | `DELETE /api/memories/{id}` | HTTP | token | Forget a memory permanently |
 
 Events pushed on `/ws/client` (all carry `importance` and `notify`):
 
 | `event` | When |
 |---|---|
-| `snapshot` | On connect: active calls, recent activity, open events |
-| `call_started` | Stream starts — includes `caller_context` (name, history, open commitments) |
+| `snapshot` | On connect: active calls, recent activity, open events, memory panel |
+| `call_started` | Stream starts — includes `caller_context` and the instant `memory_card` (facts, open commitments, safety record) |
 | `caller_memories` | Moments later: hybrid-recalled long-term memories about this caller |
+| `memory_added` | A family member added a memory via `POST /api/memories` |
 | `transcript_interim` / `transcript_update` | As words are spoken / each final sentence (instant provisional risk) |
 | `scam_update` | LLM-refined risk level |
 | `deepfake_result` | Once, ~10 s in |
@@ -151,12 +156,13 @@ lily/
 │   ├── fusion.py          EWMA multi-signal risk fusion, kill-chain stages
 │   └── deepfake.py        Hive AI check over a warm pooled connection
 └── memory/
-    ├── models.py          typed memories (episode/commitment/person/preference/win/safety)
+    ├── models.py          typed memories + lifecycle status (active/superseded/expired)
     ├── embeddings.py      OpenAI embeddings, injectable provider
-    ├── store.py           SQLite + FTS5 + in-process vector index
-    ├── service.py         hybrid recall facade (cosine + BM25 + salience)
+    ├── store.py           SQLite + FTS5 + in-process vector index, scoped search, migrations
+    ├── service.py         hybrid recall facade (calibrated fusion, MMR, profile card)
+    ├── lifecycle.py       dedupe-reinforce, supersession, expiry, when-text resolver
     └── operational.py     callers/calls/events/activity store; PII redaction
-tests/                     53 unit tests (no network required)
+tests/                     90+ unit tests (no network required)
 ```
 
 ## Research grounding
