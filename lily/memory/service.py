@@ -299,6 +299,51 @@ class MemoryService:
 
     # ----- product-shaped helpers -------------------------------------------
 
+    async def profile(self, caller: str, name: str = "") -> dict:
+        """Caller profile card: stable facts + open commitments + recent
+        history + safety record. One SQL round-trip, no embeddings, no LLM —
+        instant on call start and identical under NullEmbedder."""
+        now = time.time()
+        rows = await self.db.profile_rows(caller, now)
+        safety = rows["safety"]
+        return {
+            "caller": caller,
+            "name": name,
+            "facts": [m.to_dict() for m in rows["facts"]],
+            "open_commitments": [m.to_dict() for m in rows["commitments"]],
+            "recent": [
+                {**m.to_dict(), "content": m.content[:200]} for m in rows["recent"]
+            ],
+            "safety": {
+                "count": len(safety),
+                "last": safety[0].content if safety else "",
+                "last_at": safety[0].created_at if safety else 0,
+            },
+        }
+
+    @staticmethod
+    def render_profile(profile: dict, max_chars: int = 600) -> str:
+        """Compact plain-text block ready for prompt injection."""
+        lines = []
+        who = " ".join(filter(None, [profile.get("name"), profile.get("caller")]))
+        if who:
+            lines.append(f"Caller: {who}")
+        if profile["facts"]:
+            lines.append("Known: " + "; ".join(f["content"] for f in profile["facts"][:4]))
+        if profile["open_commitments"]:
+            lines.append(
+                "Open: " + "; ".join(c["content"] for c in profile["open_commitments"][:3])
+            )
+        if profile["recent"]:
+            lines.append("Recently: " + profile["recent"][0]["content"])
+        if profile["safety"]["count"]:
+            lines.append(
+                f"Safety: {profile['safety']['count']} past scam-risk call(s); "
+                f"last: {profile['safety']['last'][:120]}"
+            )
+        text = "\n".join(lines)
+        return text[:max_chars]
+
     async def caller_context(self, caller: str, name: str = "") -> list[dict]:
         """Memories to surface when this caller rings — Cognitive Continuity."""
         # Query on real signal only (who is calling); generic keyword padding

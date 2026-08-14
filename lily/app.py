@@ -38,7 +38,7 @@ from lily.detection.detector import analyze_scam
 from lily.detection.heuristics import max_level, score_text
 from lily.events import extract_events, has_event_trigger
 from lily.hub import IMPORTANT, INFO, NOTABLE, URGENT, hub, push_activity
-from lily.memory import MemoryService
+from lily.memory import MemoryService, MemoryType
 from lily.memory.operational import MemoryStore, redact
 from lily.summarizer import generate_summary
 from lily.transcription import GoogleStreamingSession
@@ -297,12 +297,19 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
 
     # Cognitive continuity: give the dashboard gentle context about who this is.
     ctx = await store.caller_context(caller)
+    # Profile card is pure indexed SQL — instant, no embedding round-trip.
+    try:
+        card = await memory.profile(caller, ctx.get("name", ""))
+    except Exception:
+        log.exception("memory profile failed for %s", caller)
+        card = None
     await hub.broadcast({
         "event": "call_started",
         "call_sid": call_sid,
         "caller": caller,
         "screened": screened,
         "caller_context": ctx,
+        "memory_card": card,
     }, NOTABLE)
     # Long-term memories arrive as a follow-up so the embedding round-trip
     # never delays the call_started push.
@@ -446,13 +453,19 @@ async def _intervene(call_sid: str) -> None:
         log.exception("intervention failed for %s", call_sid)
 
 
+async def _capture_commitment(call_sid: str, caller: str, title: str, when: str) -> int:
+    """One write path for commitments: the COMMITMENT memory and its
+    operational event twin are linked, so completing one closes both."""
+    mem = await memory.remember_commitment(call_sid, caller, title, when)
+    return await store.add_event(call_sid, caller, title, when, memory_id=mem.id)
+
+
 async def _capture_events(call_sid: str, sentence: str) -> None:
     """Active Assistance: turn a spoken commitment into a stored reminder."""
     session = registry.get(call_sid)
     caller = session.caller if session else "unknown"
     for event in await extract_events(sentence):
-        event_id = await store.add_event(call_sid, caller, event["title"], event["when"])
-        _spawn(memory.remember_commitment(call_sid, caller, event["title"], event["when"]))
+        event_id = await _capture_commitment(call_sid, caller, event["title"], event["when"])
         title = event["title"] + (f" — {event['when']}" if event["when"] else "")
         await push_activity(
             "event_captured", "Event captured", title, NOTABLE, call_sid, store,
@@ -494,6 +507,44 @@ async def _run_deepfake_check(call_sid: str, mulaw_bytes: bytes) -> None:
         _spawn(_refine_scam(call_sid))
 
 
+_FACT_KINDS = {
+    "person": (MemoryType.PERSON, 0.7),
+    "preference": (MemoryType.PREFERENCE, 0.6),
+    "win": (MemoryType.WIN, 0.6),
+}
+
+
+def _capture_facts(call_sid: str, caller: str, facts: list) -> None:
+    """Durable facts piggybacked on the summary call — zero marginal LLM cost."""
+    seen: set[str] = set()
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        kind = str(fact.get("kind", "")).lower()
+        content = str(fact.get("content", "")).strip()
+        if kind not in _FACT_KINDS or len(content) < 15 or content.lower() in seen:
+            continue
+        seen.add(content.lower())
+        memory_type, importance = _FACT_KINDS[kind]
+        entities = [str(e) for e in fact.get("entities", []) if e]
+        _spawn(memory.remember(
+            content,
+            memory_type=memory_type,
+            entities=entities,
+            topics=["extracted"],
+            importance=importance,
+            confidence=0.7,
+            # Preferences describe the user, not the caller — global scope.
+            caller="" if memory_type == MemoryType.PREFERENCE else caller,
+            call_sid=call_sid,
+        ))
+        if kind == "win":
+            _spawn(push_activity(
+                "good_news", "A nice moment from today's call", content,
+                NOTABLE, call_sid, store,
+            ))
+
+
 async def _finalize_call(call_sid: str) -> None:
     session = registry.pop(call_sid)
     if session is None:
@@ -518,11 +569,20 @@ async def _finalize_call(call_sid: str) -> None:
     _spawn(memory.remember_call(
         call_sid, session.caller, str(summary.get("summary", "")), final_level,
     ))
+    # Summary-extracted commitments join the same linked write path as
+    # mid-call captures; skip ones already captured during the call.
+    seen_titles = {
+        e["title"].lower() for e in await store.events_for_call(call_sid)
+    }
     for event in summary.get("events", []):
         if isinstance(event, dict) and event.get("title"):
-            _spawn(store.add_event(
-                call_sid, session.caller, str(event["title"]), str(event.get("when", ""))
+            title = str(event["title"])
+            if title.lower() in seen_titles:
+                continue
+            _spawn(_capture_commitment(
+                call_sid, session.caller, title, str(event.get("when", ""))
             ))
+    _capture_facts(call_sid, session.caller, summary.get("facts", []))
 
     await hub.broadcast({
         "event": "call_summary",
@@ -570,6 +630,10 @@ async def client_ws(websocket: WebSocket):
             ],
             "recent_activity": await store.recent_activity(20),
             "open_events": await store.open_events(20),
+            "memory": {
+                "count": await memory.count(),
+                "recent": await memory.recent(10),
+            },
         }
         await websocket.send_text(json.dumps(snapshot, separators=(",", ":")))
         while True:
@@ -594,7 +658,11 @@ async def api_events():
 
 @app.post("/api/events/{event_id}/complete", dependencies=[Depends(require_client_token)])
 async def api_complete_event(event_id: int):
-    await store.complete_event(event_id)
+    memory_id = await store.complete_event(event_id)
+    if memory_id:
+        # Done in one store means done in both: the COMMITMENT memory twin
+        # leaves recall and the profile card too.
+        _spawn(memory.complete_commitment(memory_id))
     return {"ok": True}
 
 
@@ -605,7 +673,8 @@ async def api_calls(limit: int = 20):
 
 @app.get("/api/caller/{number}", dependencies=[Depends(require_client_token)])
 async def api_caller(number: str):
-    return await store.caller_context(number)
+    ctx = await store.caller_context(number)
+    return {**ctx, "memory_card": await memory.profile(number, ctx.get("name", ""))}
 
 
 @app.post("/api/contacts/trusted", dependencies=[Depends(require_client_token)])
@@ -615,17 +684,47 @@ async def api_set_trusted(payload: dict):
         raise HTTPException(status_code=422, detail="number required")
     trusted = bool(payload.get("trusted", True))
     name = str(payload.get("name", ""))
+    note = str(payload.get("note", ""))
     await store.set_trusted(number, trusted, name)
     if trusted and name:
-        _spawn(memory.remember_person(number, name))
+        # PERSON supersession makes re-trusting with a new note replace the
+        # old fact instead of stacking a second one.
+        _spawn(memory.remember_person(number, name, note))
     return {"ok": True}
 
 
 # ----- Memory REST (lily.memory) ----------------------------------------------
 
 @app.get("/api/memories", dependencies=[Depends(require_client_token)])
-async def api_memories(limit: int = 50, memory_type: str = "", caller: str = ""):
-    return {"memories": await memory.recent(min(limit, 200), memory_type, caller)}
+async def api_memories(
+    limit: int = 50, memory_type: str = "", caller: str = "", include_inactive: bool = False
+):
+    """include_inactive exposes superseded/expired rows as an audit trail."""
+    return {
+        "memories": await memory.recent(min(limit, 200), memory_type, caller, include_inactive)
+    }
+
+
+@app.post("/api/memories", dependencies=[Depends(require_client_token)])
+async def api_memories_add(payload: dict):
+    """Family write path: 'Mom prefers the morning pharmacy run'."""
+    content = str(payload.get("content", "")).strip()
+    if not content or len(content) > 500:
+        raise HTTPException(status_code=422, detail="content must be 1-500 characters")
+    memory_type = str(payload.get("memory_type", MemoryType.PREFERENCE))
+    if memory_type not in MemoryType.ALL:
+        raise HTTPException(status_code=422, detail=f"memory_type must be one of {MemoryType.ALL}")
+    topics = [str(t) for t in payload.get("topics", []) if t]
+    m = await memory.remember(
+        content,
+        memory_type=memory_type,
+        topics=topics + ["family_note"],
+        importance=0.8,
+        confidence=1.0,
+        caller=str(payload.get("caller", "")),
+    )
+    await hub.broadcast({"event": "memory_added", "memory": m.to_dict()}, NOTABLE)
+    return m.to_dict()
 
 
 @app.get("/api/memories/search", dependencies=[Depends(require_client_token)])

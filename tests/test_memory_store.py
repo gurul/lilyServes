@@ -96,6 +96,44 @@ def test_call_and_events_and_activity(store):
     asyncio.run(run())
 
 
+def test_event_memory_link_roundtrip(store):
+    async def run():
+        event_id = await store.add_event("CA1", "+15551", "Pharmacy pickup", "Friday",
+                                         memory_id="mem123")
+        linked = await store.events_for_call("CA1")
+        assert linked[0]["memory_id"] == "mem123"
+        assert await store.complete_event(event_id) == "mem123"
+        # Unlinked events return '' so callers can skip the twin-close.
+        plain = await store.add_event("CA2", "+15552", "Call back", "")
+        assert await store.complete_event(plain) == ""
+    asyncio.run(run())
+
+
+def test_events_migration_from_pre_link_schema(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / "lily.db")
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, call_sid TEXT, "
+        "number TEXT, title TEXT, when_text TEXT, created_at REAL, done INTEGER DEFAULT 0)"
+    )
+    db.execute(
+        "INSERT INTO events (call_sid, number, title, when_text, created_at) "
+        "VALUES ('CA0', '+1555', 'Old event', '', 0)"
+    )
+    db.commit()
+    db.close()
+
+    s = MemoryStore(str(tmp_path), retain_transcripts=False)
+
+    async def run():
+        await s.open()  # guarded ALTER must upgrade in place
+        events = await s.open_events()
+        assert events[0]["title"] == "Old event"
+        assert await s.complete_event(events[0]["id"]) == ""
+        await s.close()
+    asyncio.run(run())
+
+
 def test_transcript_retention_flag(tmp_path):
     s = MemoryStore(str(tmp_path), retain_transcripts=True)
 

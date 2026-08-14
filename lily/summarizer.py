@@ -28,6 +28,11 @@ Given a phone call transcript (the caller's side only), produce JSON with:
 - risk_level: "low", "medium", or "high"
 - recommended_action: one short sentence (e.g. "Hang up if they call back", "This appears legitimate")
 - events: list of concrete commitments mentioned, each {"title": str, "when": str} (empty if none)
+- facts: list of durable things learned about people or preferences, each \
+{"kind": "person"|"preference"|"win", "content": one short sentence, "entities": [names]}. \
+Use "person" for who someone is or how they relate, "preference" for how the user \
+likes things done, "win" for a genuinely positive moment worth celebrating. \
+Empty if nothing durable was learned.
 
 Respond with valid JSON only."""
 
@@ -37,6 +42,7 @@ _FALLBACK = {
     "risk_level": "low",
     "recommended_action": "N/A",
     "events": [],
+    "facts": [],
 }
 
 

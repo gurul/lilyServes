@@ -484,6 +484,53 @@ def test_completed_commitment_expires(svc):
     asyncio.run(run())
 
 
+# ----- profile card ----------------------------------------------------------
+
+
+def test_profile_card_sections(svc):
+    async def run():
+        caller = "+15551110000"
+        await svc.remember_person(caller, "Susan", "daughter, calls Sundays")
+        await svc.remember("Prefers morning calls", MemoryType.PREFERENCE)
+        await svc.remember_commitment("CA1", caller, "Pharmacy pickup", "tomorrow at 4 pm")
+        await svc.remember("Chatted about the garden", MemoryType.EPISODE, caller=caller)
+        await svc.remember("Pushed gift cards — scam", MemoryType.SAFETY,
+                           importance=0.9, caller=caller)
+        await _drain(svc)()
+
+        profile = await svc.profile(caller, "Susan")
+        assert any("Susan" in f["content"] for f in profile["facts"])
+        assert any("morning" in f["content"].lower() for f in profile["facts"])  # global prefs included
+        assert profile["open_commitments"][0]["content"].startswith("Pharmacy pickup")
+        assert profile["safety"]["count"] == 1
+        assert profile["recent"]
+
+        text = MemoryService.render_profile(profile)
+        assert len(text) <= 600
+        assert "Susan" in text and "Pharmacy" in text
+    asyncio.run(run())
+
+
+def test_profile_excludes_retired_rows(svc):
+    async def run():
+        caller = "+15551110000"
+        done = await svc.remember_commitment("CA1", caller, "Pharmacy pickup", "Friday")
+        await _drain(svc)()
+        await svc.complete_commitment(done.id)
+        profile = await svc.profile(caller)
+        assert profile["open_commitments"] == []
+    asyncio.run(run())
+
+
+def test_profile_for_unknown_caller_is_minimal(svc):
+    async def run():
+        profile = await svc.profile("+19998887777")
+        assert profile["facts"] == [] and profile["open_commitments"] == []
+        assert profile["safety"]["count"] == 0
+        assert MemoryService.render_profile(profile) != ""  # still renders the caller line
+    asyncio.run(run())
+
+
 def test_persistence_across_reopen(tmp_path):
     async def run():
         s1 = MemoryService(str(tmp_path), embedder=FakeEmbedder())

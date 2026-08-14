@@ -106,6 +106,12 @@ class MemoryStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        # events.memory_id links an event to its COMMITMENT memory twin so
+        # completing one closes both. Guarded migration for existing DBs.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        if "memory_id" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN memory_id TEXT DEFAULT ''")
+            conn.commit()
         return conn
 
     async def open(self) -> None:
@@ -260,17 +266,29 @@ class MemoryStore:
 
     # ----- events (Memory Sync / Active Assistance) --------------------------
 
-    async def add_event(self, call_sid: str, number: str, title: str, when_text: str) -> int:
+    async def add_event(
+        self, call_sid: str, number: str, title: str, when_text: str, memory_id: str = ""
+    ) -> int:
         def w(conn: sqlite3.Connection):
             cur = conn.execute(
-                "INSERT INTO events (call_sid, number, title, when_text, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (call_sid, number, redact(title), redact(when_text), time.time()),
+                "INSERT INTO events (call_sid, number, title, when_text, created_at, "
+                "memory_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (call_sid, number, redact(title), redact(when_text), time.time(), memory_id),
             )
             conn.commit()
             return cur.lastrowid
 
         return await self._run(w)
+
+    async def events_for_call(self, call_sid: str) -> list[dict]:
+        def q(conn: sqlite3.Connection):
+            rows = conn.execute(
+                "SELECT id, title, when_text, memory_id FROM events WHERE call_sid = ?",
+                (call_sid,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        return await self._run(q)
 
     async def open_events(self, limit: int = 50) -> list[dict]:
         def q(conn: sqlite3.Connection):
@@ -283,12 +301,18 @@ class MemoryStore:
 
         return await self._run(q)
 
-    async def complete_event(self, event_id: int) -> None:
+    async def complete_event(self, event_id: int) -> str:
+        """Mark an event done. Returns the linked memory id ('' if none) so
+        the caller can retire the COMMITMENT memory twin."""
         def w(conn: sqlite3.Connection):
+            row = conn.execute(
+                "SELECT memory_id FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
             conn.execute("UPDATE events SET done = 1 WHERE id = ?", (event_id,))
             conn.commit()
+            return row["memory_id"] if row else ""
 
-        await self._run(w)
+        return await self._run(w)
 
     # ----- activity feed -----------------------------------------------------
 
