@@ -68,7 +68,13 @@ CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity(ts);
 CREATE INDEX IF NOT EXISTS idx_events_number ON events(number);
 """
 
-# Redaction: long digit runs (cards, SSN with/without dashes, codes).
+# Redaction: long digit runs (cards, SSN with/without dashes, codes), plus
+# context-keyed short secrets ("my PIN is 1234") that the length-based rules
+# are too coarse to catch.
+_RE_PIN = re.compile(
+    r"(?i)\b(pin|code|otp|cvv|passcode|password|one[- ]time)\b"
+    r"(\W{0,3}(?:is|was|:)?\W{0,3})(\d{3,8})\b"
+)
 _RE_CARD = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 _RE_SSN = re.compile(r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b")
 _RE_CODE = re.compile(r"\b\d{5,8}\b")
@@ -78,6 +84,7 @@ def redact(text: str) -> str:
     """Scrub sequences that look like card numbers, SSNs, or one-time codes."""
     if not text:
         return text
+    text = _RE_PIN.sub(lambda m: m.group(1) + m.group(2) + "[redacted code]", text)
     text = _RE_CARD.sub("[redacted number]", text)
     text = _RE_SSN.sub("[redacted number]", text)
     text = _RE_CODE.sub("[redacted code]", text)
@@ -91,6 +98,7 @@ class MemoryStore:
         self._retain_transcripts = retain_transcripts
         self._lock = asyncio.Lock()
         self._conn: sqlite3.Connection | None = None
+        self._closed = False
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, check_same_thread=False)
@@ -105,14 +113,19 @@ class MemoryStore:
         log.info("memory store open at %s", self._path)
 
     async def close(self) -> None:
-        if self._conn is not None:
-            await asyncio.to_thread(self._conn.close)
-            self._conn = None
+        # Take the lock so no query can be mid-flight on the connection.
+        async with self._lock:
+            if self._conn is not None:
+                await asyncio.to_thread(self._conn.close)
+                self._conn = None
+            self._closed = True
 
-    async def _run(self, fn, *args) -> Any:
+    async def _run(self, fn) -> Any:
         """Serialize DB work onto a thread, one operation at a time."""
         async with self._lock:
-            return await asyncio.to_thread(fn, *args)
+            if self._closed or self._conn is None:
+                raise RuntimeError("memory store closed")
+            return await asyncio.to_thread(fn, self._conn)
 
     # ----- callers -----------------------------------------------------------
 
@@ -129,7 +142,7 @@ class MemoryStore:
             ).fetchall()
             return caller, events
 
-        caller, events = await self._run(q, self._conn)
+        caller, events = await self._run(q)
         if caller is None:
             return {"known": False, "number": number}
         return {
@@ -156,7 +169,7 @@ class MemoryStore:
             )
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     async def set_trusted(self, number: str, trusted: bool, name: str = "") -> None:
         now = time.time()
@@ -170,7 +183,7 @@ class MemoryStore:
             )
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     async def add_scam_strike(self, number: str) -> int:
         now = time.time()
@@ -188,7 +201,7 @@ class MemoryStore:
             ).fetchone()
             return row["scam_strikes"] if row else 1
 
-        return await self._run(w, self._conn)
+        return await self._run(w)
 
     # ----- calls -------------------------------------------------------------
 
@@ -201,7 +214,7 @@ class MemoryStore:
             )
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     async def record_call_end(
         self,
@@ -231,7 +244,7 @@ class MemoryStore:
             )
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     async def recent_calls(self, limit: int = 20) -> list[dict]:
         def q(conn: sqlite3.Connection):
@@ -243,7 +256,7 @@ class MemoryStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
-        return await self._run(q, self._conn)
+        return await self._run(q)
 
     # ----- events (Memory Sync / Active Assistance) --------------------------
 
@@ -257,7 +270,7 @@ class MemoryStore:
             conn.commit()
             return cur.lastrowid
 
-        return await self._run(w, self._conn)
+        return await self._run(w)
 
     async def open_events(self, limit: int = 50) -> list[dict]:
         def q(conn: sqlite3.Connection):
@@ -268,14 +281,14 @@ class MemoryStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
-        return await self._run(q, self._conn)
+        return await self._run(q)
 
     async def complete_event(self, event_id: int) -> None:
         def w(conn: sqlite3.Connection):
             conn.execute("UPDATE events SET done = 1 WHERE id = ?", (event_id,))
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     # ----- activity feed -----------------------------------------------------
 
@@ -290,7 +303,7 @@ class MemoryStore:
             )
             conn.commit()
 
-        await self._run(w, self._conn)
+        await self._run(w)
 
     async def recent_activity(self, limit: int = 50) -> list[dict]:
         def q(conn: sqlite3.Connection):
@@ -301,4 +314,4 @@ class MemoryStore:
             ).fetchall()
             return [dict(r) for r in rows]
 
-        return await self._run(q, self._conn)
+        return await self._run(q)

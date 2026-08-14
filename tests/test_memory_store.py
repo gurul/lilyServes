@@ -22,6 +22,17 @@ def test_redact_preserves_short_numbers():
     assert redact(text) == text
 
 
+def test_redact_context_keyed_pin():
+    assert "1234" not in redact("My PIN is 1234")
+    assert "4321" not in redact("the code is 4321")
+    assert "PIN" in redact("My PIN is 1234")  # keyword survives, digits don't
+
+
+def test_redact_leaves_phone_numbers_alone():
+    text = "call me back at 555-123-4567"
+    assert redact(text) == text
+
+
 @pytest.fixture()
 def store(tmp_path):
     s = MemoryStore(str(tmp_path), retain_transcripts=False)
@@ -97,7 +108,6 @@ def test_transcript_retention_flag(tmp_path):
         # transcript column not included in recent_calls payload, check directly
         row = await s._run(
             lambda conn: conn.execute("SELECT transcript FROM calls WHERE call_sid='CA9'").fetchone(),
-            s._conn,
         )
         assert row["transcript"] == "hello there"
         await s.close()

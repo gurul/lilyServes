@@ -19,13 +19,19 @@ from lily.memory.store import MemoryDB
 
 log = logging.getLogger("lily.memory")
 
-# Rank fusion weights — semantic first, lexical second, then salience:
-# how much a memory matters and how fresh it is.
+# Rank fusion — relevance first, salience as a bounded multiplier.
+# Semantic evidence outweighs lexical 2:1; importance and recency can shade a
+# score but can never buy an irrelevant memory past the floor.
 W_SEMANTIC = 0.50
 W_LEXICAL = 0.25
-W_IMPORTANCE = 0.15
-W_RECENCY = 0.10
 RECENCY_HALF_LIFE_DAYS = 30.0
+
+# Cosine calibration anchors for text-embedding-3-small@512: below the floor
+# is noise, above the ceiling is a near-duplicate.
+COS_FLOOR = 0.25
+COS_CEIL = 0.75
+# Minimum relevance evidence before salience is even considered.
+REL_FLOOR = 0.15
 
 # A memory recalled for a caller-context card must clear this floor so the
 # dashboard shows genuinely related context, not the least-bad match.
@@ -36,18 +42,35 @@ class MemoryService:
     def __init__(self, data_dir: str, embedder=None) -> None:
         self.db = MemoryDB(data_dir)
         self.embedder = embedder if embedder is not None else OpenAIEmbedder()
-        self._embed_tasks: set[asyncio.Task] = set()
+        self._bg_tasks: set[asyncio.Task] = set()
+        self._closing = False
 
     @classmethod
     def lexical_only(cls, data_dir: str) -> MemoryService:
         return cls(data_dir, embedder=NullEmbedder())
 
+    def _track(self, coro) -> None:
+        """Run a background coroutine, tracked so close() can drain it."""
+        if self._closing:
+            coro.close()
+            return
+        task = asyncio.get_running_loop().create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     async def open(self) -> None:
         await self.db.open()
+        # Heal rows written while the embedder was down.
+        missing = await self.db.missing_embedding_ids()
+        if missing:
+            memories = await self.db.get_many(missing)
+            for memory in memories.values():
+                self._track(self._embed_and_store(memory))
 
     async def close(self) -> None:
-        if self._embed_tasks:
-            await asyncio.gather(*self._embed_tasks, return_exceptions=True)
+        self._closing = True
+        while self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
         await self.db.close()
 
     # ----- write path --------------------------------------------------------
@@ -75,9 +98,7 @@ class MemoryService:
             call_sid=call_sid,
         )
         await self.db.insert(memory)
-        task = asyncio.get_running_loop().create_task(self._embed_and_store(memory))
-        self._embed_tasks.add(task)
-        task.add_done_callback(self._embed_tasks.discard)
+        self._track(self._embed_and_store(memory))
         log.info("remembered %s memory %s", memory.memory_type, memory.id[:8])
         return memory
 
@@ -127,20 +148,28 @@ class MemoryService:
                 continue
             if caller and memory.caller and memory.caller != caller:
                 continue
+            lex = lexical.get(mid, 0.0)
+            if query_vec is not None:
+                cos = semantic.get(mid, 0.0)
+                sem = min(1.0, max(0.0, (cos - COS_FLOOR) / (COS_CEIL - COS_FLOOR)))
+                relevance = (W_SEMANTIC * sem + W_LEXICAL * lex) / (W_SEMANTIC + W_LEXICAL)
+            else:
+                # Lexical-only mode carries full weight instead of being capped
+                # at a fraction of the scale.
+                relevance = lex
+            if relevance < REL_FLOOR:
+                continue
             age_days = max(0.0, (now - memory.created_at) / 86400.0)
             recency = math.exp(-math.log(2) * age_days / RECENCY_HALF_LIFE_DAYS)
-            score = (
-                W_SEMANTIC * semantic.get(mid, 0.0)
-                + W_LEXICAL * lexical.get(mid, 0.0)
-                + W_IMPORTANCE * memory.importance
-                + W_RECENCY * recency
-            )
+            score = relevance * (0.70 + 0.20 * memory.importance + 0.10 * recency)
             if score >= min_score:
                 ranked.append((score, memory))
 
         ranked.sort(key=lambda pair: pair[0], reverse=True)
         top = ranked[:limit]
-        await self.db.mark_recalled([m.id for _, m in top], now)
+        if top:
+            # Fire-and-forget: ring-time reads don't wait on this write.
+            self._track(self.db.mark_recalled([m.id for _, m in top], now))
         return [m.to_dict(score=s) for s, m in top]
 
     async def recent(self, limit: int = 50, memory_type: str = "", caller: str = "") -> list[dict]:

@@ -9,3 +9,4 @@ data/
 .venv/
 __pycache__/
 *.pyc
+.era/runtime/
