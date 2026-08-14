@@ -71,6 +71,13 @@ class MemoryService:
         self._bg_tasks: set[asyncio.Task] = set()
         self._closing = False
         self._last_sweep = 0.0
+        # Optional integration hooks (sync or async), fired by the lifecycle
+        # layer so the operational store's event twins stay consistent:
+        # retired(memory_id) — a COMMITMENT left recall (superseded/completed);
+        # merged(new_id, survivor_id) — a duplicate was absorbed, links should
+        # be repointed at the survivor.
+        self.on_commitment_retired = None
+        self.on_commitment_merged = None
 
     @classmethod
     def lexical_only(cls, data_dir: str) -> MemoryService:
@@ -234,8 +241,10 @@ class MemoryService:
         """Type-aware freshness, anchored to the last recall so memories the
         user keeps coming back to stay warm."""
         if memory.memory_type == MemoryType.COMMITMENT and memory.expires_at > 0:
-            # Urgency curve: salience peaks at the due date, not at creation.
-            days_out = abs(memory.expires_at - now) / 86400.0
+            # Urgency curve: salience peaks at the due date (expiry minus the
+            # grace period), not at creation time.
+            due = memory.expires_at - lifecycle.COMMITMENT_GRACE
+            days_out = abs(due - now) / 86400.0
             return max(RECENCY_FLOOR, math.exp(-days_out / URGENCY_SCALE_DAYS))
         half = RECENCY_HALF_LIFE.get(memory.memory_type, RECENCY_DEFAULT_HALF_LIFE)
         if half is None:
@@ -399,9 +408,10 @@ class MemoryService:
             confidence=1.0,
             caller=number,
         )
-        # caller + PERSON is an identity key: re-trusting with a new name or
-        # note deterministically replaces the previous fact.
+        # caller + PERSON + 'contact' is an identity key: re-trusting with a
+        # new name or note replaces the previous identity card. Extracted
+        # PERSON facts (topic 'extracted') are distinct knowledge — kept.
         for old in await self.db.recent(20, MemoryType.PERSON, number):
-            if old.id != memory.id:
+            if old.id != memory.id and "contact" in old.topics:
                 await self.db.set_status(old.id, MemoryStatus.SUPERSEDED, memory.id)
         return memory

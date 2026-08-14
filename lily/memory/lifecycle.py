@@ -15,10 +15,18 @@ when embeddings are unavailable.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import time
 
 from lily.memory.models import Memory, MemoryStatus, MemoryType
+
+log = logging.getLogger("lily.memory.lifecycle")
+
+# Twilio collapses every withheld caller ID onto shared constants; never treat
+# those as an identity worth superseding facts across.
+ANON_CALLERS = {"unknown", "anonymous"}
 
 DAY = 86400.0
 
@@ -63,6 +71,7 @@ def resolve_when(when_text: str, ref_ts: float | None = None) -> float | None:
     text = when_text.lower()
 
     day_ts: float | None = None
+    from_weekday = False
     if "today" in text or "tonight" in text:
         day_ts = ref
     elif "tomorrow" in text:
@@ -72,8 +81,11 @@ def resolve_when(when_text: str, ref_ts: float | None = None) -> float | None:
     else:
         for i, name in enumerate(_WEEKDAYS):
             if name in text or f" {name[:3]} " in f" {text} ":
-                ahead = (i - now.tm_wday) % 7 or 7
+                # 0 = today: "Friday at 4 pm" said Friday morning means today;
+                # the past-time check below rolls it forward when it's gone by.
+                ahead = (i - now.tm_wday) % 7
                 day_ts = ref + ahead * DAY
+                from_weekday = True
                 break
         if day_ts is None:
             m = _RE_MONTH_DAY.search(text)
@@ -100,10 +112,19 @@ def resolve_when(when_text: str, ref_ts: float | None = None) -> float | None:
             hour += 12
         minute = int(m.group(2) or 0)
     try:
-        return time.mktime((day.tm_year, day.tm_mon, day.tm_mday,
-                            hour, minute, 0, -1, -1, -1))
+        ts = time.mktime((day.tm_year, day.tm_mon, day.tm_mday,
+                          hour, minute, 0, -1, -1, -1))
     except (ValueError, OverflowError):
         return None
+    if from_weekday and ts < ref - 300:
+        # A same-day weekday mention whose time already passed means next week.
+        rolled = time.localtime(day_ts + 7 * DAY)
+        try:
+            ts = time.mktime((rolled.tm_year, rolled.tm_mon, rolled.tm_mday,
+                              hour, minute, 0, -1, -1, -1))
+        except (ValueError, OverflowError):
+            return None
+    return ts
 
 
 def _next_date(now: time.struct_time, month: int, day: int) -> float | None:
@@ -163,6 +184,28 @@ def _commitment_titles_match(new: Memory, old: Memory) -> bool:
     return _token_jaccard(title_new, title_old) >= 0.4
 
 
+def _commitment_whens_match(new: Memory, old: Memory) -> bool:
+    """True when two commitments carry the same schedule — same when-text and
+    same resolved expiry. A changed schedule is a reschedule, not a duplicate."""
+    when_new = new.content.split("—", 1)[1] if "—" in new.content else ""
+    when_old = old.content.split("—", 1)[1] if "—" in old.content else ""
+    if when_new.strip().lower() != when_old.strip().lower():
+        return False
+    return abs(new.expires_at - old.expires_at) < DAY
+
+
+async def _fire(hook, *args) -> None:
+    """Invoke an optional integration hook; sync or async, never raises."""
+    if hook is None:
+        return
+    try:
+        result = hook(*args)
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        log.exception("lifecycle hook failed")
+
+
 async def maintain(service, memory: Memory, vector: list[float] | None) -> None:
     """Post-write hygiene: reinforce duplicates, supersede changed facts.
 
@@ -189,29 +232,38 @@ async def maintain(service, memory: Memory, vector: list[float] | None) -> None:
         cosines = await service.db.similarity_to([m.id for m in candidates], vector)
 
     new_shingles = _shingles(memory.content)
+    is_commitment = memory.memory_type == MemoryType.COMMITMENT
     for old in candidates:
         cos = cosines.get(old.id, 0.0)
         sh_jac = _jaccard(new_shingles, _shingles(old.content))
 
         duplicate = cos >= DUP_COSINE or sh_jac >= DUP_JACCARD
-        if duplicate and memory.memory_type == MemoryType.COMMITMENT:
-            # Reschedules share prose; only the same errand title is a dupe.
-            duplicate = _commitment_titles_match(memory, old)
+        if duplicate and is_commitment:
+            if not _commitment_titles_match(memory, old):
+                duplicate = False  # similar prose, different errand
+            elif not _commitment_whens_match(memory, old):
+                # Same errand, new schedule: a reschedule supersedes — merging
+                # would silently discard the new due date.
+                if await service.db.set_status(old.id, MemoryStatus.SUPERSEDED, memory.id):
+                    await _fire(service.on_commitment_retired, old.id)
+                continue
         if duplicate:
-            merged = await service.db.reinforce(
-                old.id, memory.content, memory.importance, memory.confidence,
-                memory.entities, memory.topics, time.time(),
-            )
-            if merged:  # target may have been deleted while we were comparing
-                await service.db.delete(memory.id)
+            # Atomic reinforce+delete; both rows re-checked inside the write.
+            if await service.db.merge_into(old.id, memory, time.time()):
+                if is_commitment:
+                    await _fire(service.on_commitment_merged, memory.id, old.id)
                 return  # the new row merged into the old — nothing left to do
             continue
 
         if memory.memory_type not in SUPERSEDABLE:
             continue
+        if memory.caller.lower() in ANON_CALLERS:
+            continue  # shared anonymous bucket is not an identity
         same_subject_band = (
             SUPERSEDE_COSINE <= cos < DUP_COSINE
             or SUPERSEDE_JACCARD <= sh_jac < DUP_JACCARD
         )
         if same_subject_band and _shares_subject(memory, old):
-            await service.db.set_status(old.id, MemoryStatus.SUPERSEDED, memory.id)
+            if await service.db.set_status(old.id, MemoryStatus.SUPERSEDED, memory.id):
+                if is_commitment:
+                    await _fire(service.on_commitment_retired, old.id)
