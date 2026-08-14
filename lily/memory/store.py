@@ -111,21 +111,31 @@ class MemoryDB:
         for col, ddl in _MIGRATIONS:
             if col not in cols:
                 conn.execute(ddl)
+                if col == "expires_at":
+                    # One-shot backfill: pre-upgrade commitments would otherwise
+                    # never expire and clutter the profile card forever.
+                    conn.execute(
+                        "UPDATE memories SET expires_at = created_at + 1209600.0 "
+                        "WHERE memory_type = 'commitment'"
+                    )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_caller_type ON memories(caller, memory_type)"
         )
         conn.commit()
+        # Missing triggers mean the previous session ran without FTS — its
+        # writes bypassed the index, so a rebuild is owed regardless of what
+        # the row counts happen to say (updates/deletes can equalize them).
+        had_triggers = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'memories_ai'"
+        ).fetchone() is not None
         try:
             conn.executescript(_FTS_SCHEMA)
             self.fts_enabled = True
-            # Backfill rows written while FTS was unavailable (external-content
-            # tables only index through the triggers, so a downgraded build
-            # leaves gaps).
             missing = conn.execute(
                 "SELECT (SELECT count(*) FROM memories) - (SELECT count(*) FROM memories_fts)"
             ).fetchone()[0]
-            if missing:
+            if missing or not had_triggers:
                 conn.execute("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')")
                 conn.commit()
                 log.info("rebuilt FTS index (%d rows were unindexed)", missing)
@@ -232,7 +242,7 @@ class MemoryDB:
             if not cur.rowcount:
                 return None
             return conn.execute(
-                "SELECT caller, memory_type FROM memories WHERE id = ?", (memory_id,)
+                "SELECT caller, memory_type, status FROM memories WHERE id = ?", (memory_id,)
             ).fetchone()
 
         vec = np.asarray(vector, dtype=np.float32)
@@ -243,6 +253,8 @@ class MemoryDB:
             row = await asyncio.to_thread(w, self._conn_or_raise())
             if row is None or norm == 0:
                 return  # memory deleted before the embedding landed, or degenerate
+            if row["status"] != "active":
+                return  # retired mid-flight: blob kept, but no ghost index row
             vec = vec / norm
             if self._vectors is not None and vec.shape[0] != self._vectors.shape[1]:
                 log.warning(
@@ -526,6 +538,14 @@ class MemoryDB:
         now = time.time()
 
         def w(conn: sqlite3.Connection):
+            if superseded_by:
+                # Never retire a fact in favor of a row that no longer exists
+                # (e.g. the replacement was forgotten while maintenance ran).
+                exists = conn.execute(
+                    "SELECT 1 FROM memories WHERE id = ?", (superseded_by,)
+                ).fetchone()
+                if exists is None:
+                    return False
             cur = conn.execute(
                 "UPDATE memories SET status = ?, superseded_by = ?, updated_at = ? "
                 "WHERE id = ?",
@@ -556,46 +576,56 @@ class MemoryDB:
                     out[mid] = float(self._vectors[self._vec_ids.index(mid)] @ vec)
             return out
 
-    async def reinforce(
-        self,
-        memory_id: str,
-        content: str,
-        importance: float,
-        confidence: float,
-        entities: list[str],
-        topics: list[str],
-        now: float,
-    ) -> bool:
-        """A repeated observation strengthens the existing memory instead of
-        duplicating it: bump importance, union tags, keep the richer content.
-        Returns False when the target no longer exists."""
+    async def merge_into(self, old_id: str, memory, now: float) -> bool:
+        """Atomically absorb the (newer) `memory` row into `old_id`: reinforce
+        the old row and delete the new one in a single commit. Both rows are
+        re-checked inside the critical section, so a concurrent forget() can
+        never have its content resurrected by a half-done merge.
+        Returns False (no writes) when either row is gone or retired."""
         def w(conn: sqlite3.Connection):
-            row = conn.execute(
-                "SELECT content, importance, confidence, entities, topics, source_count "
-                "FROM memories WHERE id = ? AND status = 'active'", (memory_id,)
+            old = conn.execute(
+                "SELECT content, importance, confidence, entities, topics "
+                "FROM memories WHERE id = ? AND status = 'active'", (old_id,)
             ).fetchone()
-            if row is None:
-                return False
-            merged_entities = list(dict.fromkeys(json.loads(row["entities"] or "[]") + entities))
-            merged_topics = list(dict.fromkeys(json.loads(row["topics"] or "[]") + topics))
+            new = conn.execute(
+                "SELECT 1 FROM memories WHERE id = ? AND status = 'active'", (memory.id,)
+            ).fetchone()
+            if old is None or new is None:
+                return False, False
+            adopt = len(memory.content) > len(old["content"])
+            merged_entities = list(dict.fromkeys(
+                json.loads(old["entities"] or "[]") + memory.entities))
+            merged_topics = list(dict.fromkeys(
+                json.loads(old["topics"] or "[]") + memory.topics))
             conn.execute(
                 "UPDATE memories SET content = ?, importance = ?, confidence = ?, "
                 "entities = ?, topics = ?, source_count = source_count + 1, "
-                "updated_at = ? WHERE id = ?",
+                # Adopted content invalidates the old embedding; NULL lets the
+                # missing-embedding healer re-embed the new text.
+                "updated_at = ?, embedding = CASE WHEN ? THEN NULL ELSE embedding END "
+                "WHERE id = ?",
                 (
-                    content if len(content) > len(row["content"]) else row["content"],
-                    min(1.0, max(row["importance"], importance) + 0.05),
-                    max(row["confidence"], confidence),
+                    memory.content if adopt else old["content"],
+                    min(1.0, max(old["importance"], memory.importance) + 0.05),
+                    max(old["confidence"], memory.confidence),
                     json.dumps(merged_entities),
                     json.dumps(merged_topics),
                     now,
-                    memory_id,
+                    1 if adopt else 0,
+                    old_id,
                 ),
             )
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory.id,))
             conn.commit()
-            return True
+            return True, adopt
 
-        return await self._run(w)
+        async with self._lock:
+            merged, adopted = await asyncio.to_thread(w, self._conn_or_raise())
+            if merged:
+                self._evict_vector_locked(memory.id)
+                if adopted:
+                    self._evict_vector_locked(old_id)
+        return merged
 
     async def expire_due(self, now: float) -> list[str]:
         """Flip past-due active memories to 'expired' and evict their vectors."""

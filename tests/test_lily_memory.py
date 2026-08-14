@@ -348,12 +348,17 @@ def test_superseded_memory_hidden_but_auditable(svc):
     async def run():
         old = await svc.remember("Lives on Maple Street", MemoryType.PERSON,
                                  caller="+15551110000")
+        new = await svc.remember("Moved to Oak Avenue", MemoryType.PERSON,
+                                 caller="+15551110000")
         await _drain(svc)()
-        await svc.db.set_status(old.id, MemoryStatus.SUPERSEDED, "newid")
+        # Superseding by a nonexistent row is refused (forget()-race guard)...
+        assert await svc.db.set_status(old.id, MemoryStatus.SUPERSEDED, "ghost") is False
+        # ...but a real replacement retires the old fact.
+        assert await svc.db.set_status(old.id, MemoryStatus.SUPERSEDED, new.id) is True
         assert await svc.recall("maple street") == []
         got = await svc.db.get(old.id)  # audit reads still see everything
         assert got.status == MemoryStatus.SUPERSEDED
-        assert got.superseded_by == "newid"
+        assert got.superseded_by == new.id
         assert await svc.forget(old.id) is True  # privacy promise unchanged
     asyncio.run(run())
 
@@ -481,6 +486,139 @@ def test_completed_commitment_expires(svc):
         await _drain(svc)()
         assert await svc.complete_commitment(m.id) is True
         assert await svc.recall("pharmacy pickup") == []
+    asyncio.run(run())
+
+
+class ConstEmbedder:
+    """Every text embeds identically — models the worst case where a real
+    embedder scores a reschedule as a near-duplicate (cosine 1.0)."""
+
+    dimensions = 4
+
+    async def embed(self, texts, timeout=5.0):
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+
+def test_reschedule_supersedes_even_at_duplicate_similarity(tmp_path):
+    service = MemoryService(str(tmp_path), embedder=ConstEmbedder())
+    retired = []
+    service.on_commitment_retired = retired.append
+
+    async def run():
+        await service.open()
+        old = await service.remember_commitment("CA1", "+15551", "Pharmacy pickup",
+                                                "Friday at 4 pm")
+        await _drain(service)()
+        new = await service.remember_commitment("CA2", "+15551", "Pharmacy pickup",
+                                                "Saturday at 10 am")
+        await _drain(service)()
+        old_row = await service.db.get(old.id)
+        assert old_row.status == MemoryStatus.SUPERSEDED  # NOT merged away
+        assert old_row.superseded_by == new.id
+        assert (await service.db.get(new.id)).status == MemoryStatus.ACTIVE
+        assert retired == [old.id]
+        await service.close()
+    asyncio.run(run())
+
+
+def test_exact_repeat_commitment_merges_and_fires_hook(tmp_path):
+    service = MemoryService(str(tmp_path), embedder=ConstEmbedder())
+    merged = []
+    service.on_commitment_merged = lambda new_id, old_id: merged.append((new_id, old_id))
+
+    async def run():
+        await service.open()
+        old = await service.remember_commitment("CA1", "+15551", "Pharmacy pickup",
+                                                "Friday at 4 pm")
+        await _drain(service)()
+        new = await service.remember_commitment("CA2", "+15551", "Pharmacy pickup",
+                                                "Friday at 4 pm")
+        await _drain(service)()
+        assert await service.count() == 1
+        assert (await service.db.get(old.id)).source_count == 2
+        assert merged == [(new.id, old.id)]
+        await service.close()
+    asyncio.run(run())
+
+
+def test_merge_aborts_when_new_row_was_forgotten(svc):
+    async def run():
+        old = await svc.remember("Grandson called about lunch", MemoryType.EPISODE)
+        await _drain(svc)()
+        ghost = Memory(content="Grandson called about lunch and the spare key",
+                       memory_type=MemoryType.EPISODE)
+        await svc.db.insert(ghost)
+        await svc.db.delete(ghost.id)  # forgotten before the merge lands
+        assert await svc.db.merge_into(old.id, ghost, time.time()) is False
+        got = await svc.db.get(old.id)
+        assert "spare key" not in got.content  # forgotten text never resurrected
+        assert got.source_count == 1
+    asyncio.run(run())
+
+
+def test_set_embedding_skips_retired_row(tmp_path):
+    gate = asyncio.Event()
+
+    class GatedEmbedder(FakeEmbedder):
+        async def embed(self, texts, timeout=5.0):
+            await gate.wait()
+            return await super().embed(texts, timeout)
+
+    service = MemoryService(str(tmp_path), embedder=GatedEmbedder())
+
+    async def run():
+        await service.open()
+        m = await service.remember_commitment("CA1", "+15551", "Pharmacy pickup", "Friday")
+        await service.complete_commitment(m.id)  # retired while embed in flight
+        gate.set()
+        await _drain(service)()
+        assert m.id not in service.db._vec_ids  # no ghost vector for retired rows
+        await service.close()
+    asyncio.run(run())
+
+
+def test_remember_person_keeps_extracted_facts(svc):
+    async def run():
+        num = "+15551110000"
+        extracted = await svc.remember("Tom brings groceries on Mondays",
+                                       MemoryType.PERSON, entities=["Tom"],
+                                       topics=["extracted"], caller=num)
+        await _drain(svc)()
+        await svc.remember_person(num, "Susan", "daughter, calls Sundays")
+        await _drain(svc)()
+        got = await svc.db.get(extracted.id)
+        assert got.status == MemoryStatus.ACTIVE  # identity update spares knowledge
+    asyncio.run(run())
+
+
+def test_resolve_when_same_day_weekday():
+    ref = time.mktime((2026, 8, 14, 10, 0, 0, -1, -1, -1))  # a Friday, 10 AM
+    later_today = lifecycle.resolve_when("Friday at 4 pm", ref)
+    assert time.localtime(later_today).tm_mday == 14  # today, not next week
+    already_past = lifecycle.resolve_when("Friday at 9 am", ref)
+    assert time.localtime(already_past).tm_mday == 21  # rolled to next Friday
+
+
+def test_migration_backfills_commitment_expiry(tmp_path):
+    db_path = tmp_path / "lily_memory.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO memories (id, memory_type, content, created_at) "
+        "VALUES ('oldc', 'commitment', 'Pharmacy pickup — Friday', ?)",
+        (time.time() - 60 * 86400,),
+    )
+    conn.commit()
+    conn.close()
+
+    service = MemoryService(str(tmp_path), embedder=FakeEmbedder())
+
+    async def run():
+        await service.open()  # backfill + open-sweep expire the stale commitment
+        got = await service.db.get("oldc")
+        assert got.expires_at > 0
+        assert got.status == MemoryStatus.EXPIRED
+        await service.close()
     asyncio.run(run())
 
 
