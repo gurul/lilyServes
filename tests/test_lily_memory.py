@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from lily.memory import MemoryService, MemoryType
+from lily.memory import Memory, MemoryService, MemoryType
 
 
 class FakeEmbedder:
@@ -223,6 +223,82 @@ def test_recall_after_close_raises_cleanly(tmp_path):
         await service.close()
         with pytest.raises(RuntimeError):
             await service.db.get("nope")
+    asyncio.run(run())
+
+
+def test_caller_scope_survives_a_crowded_corpus(svc):
+    async def run():
+        for i in range(40):
+            await svc.remember(f"Pharmacy pickup chatter number {i}", MemoryType.EPISODE,
+                               caller=f"+1555000{i:04d}")
+        await svc.remember("Pharmacy pickup on Friday for Susan", MemoryType.COMMITMENT,
+                           caller="+15551110000")
+        await _drain(svc)()
+        results = await svc.recall("pharmacy pickup", caller="+15551110000")
+        assert results  # pre-pushdown, the global top-k starved this scope
+        assert all(m["caller"] in ("", "+15551110000") for m in results)
+    asyncio.run(run())
+
+
+def test_type_filter_applies_inside_vector_search(svc):
+    async def run():
+        await svc.remember("Pharmacy pickup on Friday", MemoryType.COMMITMENT)
+        await svc.remember("Chatted about the pharmacy visit", MemoryType.EPISODE)
+        await _drain(svc)()
+        results = await svc.recall("pharmacy friday pickup",
+                                   memory_types=[MemoryType.COMMITMENT])
+        assert results and all(m["memory_type"] == MemoryType.COMMITMENT for m in results)
+    asyncio.run(run())
+
+
+def test_entity_hits_outrank_content_mentions(svc):
+    async def run():
+        ride = await svc.remember("Arranged a ride for the appointment",
+                                  MemoryType.EPISODE, entities=["Susan"])
+        await svc.remember("susan was mentioned in passing today", MemoryType.EPISODE)
+        # Fillers so the term isn't in every document (BM25 IDF needs contrast).
+        await svc.remember("Grandson called about lunch", MemoryType.EPISODE)
+        await svc.remember("Doctor appointment moved", MemoryType.EPISODE)
+        await svc.remember("Gift cards are a scam sign", MemoryType.SAFETY)
+        await _drain(svc)()
+        hits = await svc.db.lexical_search("susan")
+        assert hits[0][0] == ride.id  # entity column outweighs prose mention
+    asyncio.run(run())
+
+
+def test_recency_is_type_aware():
+    import time as _time
+
+    from lily.memory.service import MemoryService as MS
+    now = _time.time()
+    old = now - 180 * 86400
+    person = Memory(content="Susan is her daughter", memory_type=MemoryType.PERSON,
+                    created_at=old)
+    episode = Memory(content="Chatted about the garden", memory_type=MemoryType.EPISODE,
+                     created_at=old)
+    commitment_old = Memory(content="Pickup", memory_type=MemoryType.COMMITMENT,
+                            created_at=now - 21 * 86400)
+    commitment_new = Memory(content="Pickup", memory_type=MemoryType.COMMITMENT,
+                            created_at=now)
+    assert MS._recency(person, now) == 1.0          # stable facts never fade
+    assert MS._recency(episode, now) < 0.1          # six-month-old chatter sinks
+    assert MS._recency(commitment_new, now) > MS._recency(commitment_old, now)
+    # Frequent recall keeps a memory warm.
+    episode_recalled = Memory(content="x", memory_type=MemoryType.EPISODE,
+                              created_at=old, last_recalled=now - 86400)
+    assert MS._recency(episode_recalled, now) > MS._recency(episode, now)
+
+
+def test_recall_deduplicates_near_identical_memories(svc):
+    async def run():
+        for _ in range(5):
+            await svc.remember("Tom stopped by to check in", MemoryType.EPISODE)
+        await svc.remember("Pharmacy pickup on Friday", MemoryType.COMMITMENT)
+        await _drain(svc)()
+        results = await svc.recall("tom check in pharmacy friday pickup", limit=5)
+        contents = [m["content"] for m in results]
+        assert contents.count("Tom stopped by to check in") == 1
+        assert any("Pharmacy pickup" in c for c in contents)
     asyncio.run(run())
 
 

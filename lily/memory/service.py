@@ -24,7 +24,25 @@ log = logging.getLogger("lily.memory")
 # score but can never buy an irrelevant memory past the floor.
 W_SEMANTIC = 0.50
 W_LEXICAL = 0.25
-RECENCY_HALF_LIFE_DAYS = 30.0
+
+# Recency half-life per memory type, in days. None = stable facts never fade.
+# COMMITMENT is short (what matters is what's coming up), SAFETY is long
+# because scammers recycle numbers months later.
+RECENCY_HALF_LIFE = {
+    MemoryType.EPISODE: 30.0,
+    MemoryType.COMMITMENT: 10.0,
+    MemoryType.WIN: 90.0,
+    MemoryType.SAFETY: 365.0,
+    MemoryType.PERSON: None,
+    MemoryType.PREFERENCE: None,
+}
+RECENCY_DEFAULT_HALF_LIFE = 30.0
+RECENCY_FLOOR = 0.05
+
+# MMR result diversification: near-duplicates above DUP_SIM never co-occur in
+# one result set; below that, relevance trades off against redundancy.
+MMR_LAMBDA = 0.75
+DUP_SIM = 0.97
 
 # Cosine calibration anchors for text-embedding-3-small@512: below the floor
 # is noise, above the ceiling is a near-duplicate.
@@ -131,10 +149,14 @@ class MemoryService:
         if vectors:
             query_vec = vectors[0]
 
-        lexical = dict(await self.db.lexical_search(query, candidate_limit))
+        lexical = dict(
+            await self.db.lexical_search(query, candidate_limit, caller, memory_types)
+        )
         semantic: dict[str, float] = {}
         if query_vec is not None:
-            semantic = dict(await self.db.vector_search(query_vec, candidate_limit))
+            semantic = dict(
+                await self.db.vector_search(query_vec, candidate_limit, caller, memory_types)
+            )
 
         candidates = set(lexical) | set(semantic)
         if not candidates:
@@ -144,33 +166,82 @@ class MemoryService:
         now = time.time()
         ranked: list[tuple[float, Memory]] = []
         for mid, memory in memories.items():
-            if memory_types and memory.memory_type not in memory_types:
-                continue
-            if caller and memory.caller and memory.caller != caller:
-                continue
             lex = lexical.get(mid, 0.0)
             if query_vec is not None:
                 cos = semantic.get(mid, 0.0)
                 sem = min(1.0, max(0.0, (cos - COS_FLOOR) / (COS_CEIL - COS_FLOOR)))
-                relevance = (W_SEMANTIC * sem + W_LEXICAL * lex) / (W_SEMANTIC + W_LEXICAL)
+                combined = (W_SEMANTIC * sem + W_LEXICAL * lex) / (W_SEMANTIC + W_LEXICAL)
+                # Semantic corroboration boosts, but its absence (memory not
+                # yet embedded, or embedder down at write time) only mildly
+                # discounts a strong lexical match — never annihilates it.
+                relevance = max(combined, 0.9 * lex)
             else:
                 # Lexical-only mode carries full weight instead of being capped
                 # at a fraction of the scale.
                 relevance = lex
             if relevance < REL_FLOOR:
                 continue
-            age_days = max(0.0, (now - memory.created_at) / 86400.0)
-            recency = math.exp(-math.log(2) * age_days / RECENCY_HALF_LIFE_DAYS)
-            score = relevance * (0.70 + 0.20 * memory.importance + 0.10 * recency)
+            score = relevance * (
+                0.70 + 0.20 * memory.importance + 0.10 * self._recency(memory, now)
+            )
             if score >= min_score:
                 ranked.append((score, memory))
 
         ranked.sort(key=lambda pair: pair[0], reverse=True)
-        top = ranked[:limit]
+        top = await self._diversify(ranked, limit)
         if top:
             # Fire-and-forget: ring-time reads don't wait on this write.
             self._track(self.db.mark_recalled([m.id for _, m in top], now))
         return [m.to_dict(score=s) for s, m in top]
+
+    @staticmethod
+    def _recency(memory: Memory, now: float) -> float:
+        """Type-aware freshness, anchored to the last recall so memories the
+        user keeps coming back to stay warm."""
+        half = RECENCY_HALF_LIFE.get(memory.memory_type, RECENCY_DEFAULT_HALF_LIFE)
+        if half is None:
+            return 1.0
+        anchor = max(memory.created_at, memory.last_recalled)
+        age_days = max(0.0, (now - anchor) / 86400.0)
+        return max(RECENCY_FLOOR, math.exp(-math.log(2) * age_days / half))
+
+    async def _diversify(
+        self, ranked: list[tuple[float, Memory]], limit: int
+    ) -> list[tuple[float, Memory]]:
+        """Greedy MMR over the top of the ranking: drop near-duplicates, favor
+        results that add information over ones that repeat it."""
+        if len(ranked) <= 1:
+            return ranked[:limit]
+        pool = ranked[: max(limit * 3, 15)]
+        vectors = await self.db.get_vectors([m.id for _, m in pool])
+
+        def sim(a: Memory, b: Memory) -> float:
+            va, vb = vectors.get(a.id), vectors.get(b.id)
+            if va is not None and vb is not None:
+                return float(va @ vb)
+            ta = set(a.content.lower().split())
+            tb = set(b.content.lower().split())
+            return len(ta & tb) / len(ta | tb) if ta and tb else 0.0
+
+        selected: list[tuple[float, Memory]] = []
+        remaining = list(pool)
+        while remaining and len(selected) < limit:
+            best_idx, best_mmr = None, -math.inf
+            drop: set[int] = set()
+            for i, (score, memory) in enumerate(remaining):
+                max_sim = max((sim(memory, s) for _, s in selected), default=0.0)
+                if max_sim > DUP_SIM:
+                    drop.add(i)
+                    continue
+                mmr = MMR_LAMBDA * score - (1 - MMR_LAMBDA) * max_sim
+                if mmr > best_mmr:
+                    best_idx, best_mmr = i, mmr
+            if best_idx is None:
+                break
+            selected.append(remaining[best_idx])
+            drop.add(best_idx)
+            remaining = [r for i, r in enumerate(remaining) if i not in drop]
+        return selected
 
     async def recent(self, limit: int = 50, memory_type: str = "", caller: str = "") -> list[dict]:
         return [m.to_dict() for m in await self.db.recent(limit, memory_type, caller)]
@@ -182,7 +253,9 @@ class MemoryService:
 
     async def caller_context(self, caller: str, name: str = "") -> list[dict]:
         """Memories to surface when this caller rings — Cognitive Continuity."""
-        query = " ".join(filter(None, [name, caller, "calls commitments history"]))
+        # Query on real signal only (who is calling); generic keyword padding
+        # just drags every query toward the same region of embedding space.
+        query = f"{name} {caller}".strip() or caller
         return await self.recall(query, limit=5, caller=caller, min_score=MIN_SCORE)
 
     async def remember_call(
