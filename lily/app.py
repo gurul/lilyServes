@@ -57,6 +57,11 @@ memory = (
     if settings.memory_embeddings
     else MemoryService.lexical_only(settings.data_dir)
 )
+# Keep the operational event twins consistent with the memory lifecycle:
+# a superseded/completed commitment closes its event; a merged duplicate
+# repoints its event at the surviving memory.
+memory.on_commitment_retired = store.complete_event_by_memory
+memory.on_commitment_merged = store.remap_event_memory
 
 # Keep strong references to fire-and-forget tasks (asyncio only holds weak ones).
 _background: set[asyncio.Task] = set()
@@ -298,11 +303,14 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
     # Cognitive continuity: give the dashboard gentle context about who this is.
     ctx = await store.caller_context(caller)
     # Profile card is pure indexed SQL — instant, no embedding round-trip.
-    try:
-        card = await memory.profile(caller, ctx.get("name", ""))
-    except Exception:
-        log.exception("memory profile failed for %s", caller)
-        card = None
+    # Withheld caller IDs share one bucket; a card for it would cross-pollinate
+    # unrelated callers.
+    card = None
+    if caller.lower() not in ("unknown", "anonymous"):
+        try:
+            card = await memory.profile(caller, ctx.get("name", ""))
+        except Exception:
+            log.exception("memory profile failed for %s", caller)
     await hub.broadcast({
         "event": "call_started",
         "call_sid": call_sid,
@@ -516,6 +524,11 @@ _FACT_KINDS = {
 
 def _capture_facts(call_sid: str, caller: str, facts: list) -> None:
     """Durable facts piggybacked on the summary call — zero marginal LLM cost."""
+    if not isinstance(facts, list):
+        return
+    if caller.lower() in ("unknown", "anonymous"):
+        # Withheld caller IDs share one bucket — never attribute facts to it.
+        caller = ""
     seen: set[str] = set()
     for fact in facts:
         if not isinstance(fact, dict):
@@ -526,7 +539,10 @@ def _capture_facts(call_sid: str, caller: str, facts: list) -> None:
             continue
         seen.add(content.lower())
         memory_type, importance = _FACT_KINDS[kind]
-        entities = [str(e) for e in fact.get("entities", []) if e]
+        raw_entities = fact.get("entities")
+        entities = (
+            [str(e) for e in raw_entities if e] if isinstance(raw_entities, list) else []
+        )
         _spawn(memory.remember(
             content,
             memory_type=memory_type,
@@ -577,7 +593,8 @@ async def _finalize_call(call_sid: str) -> None:
     for event in summary.get("events", []):
         if isinstance(event, dict) and event.get("title"):
             title = str(event["title"])
-            if title.lower() in seen_titles:
+            # Stored titles are redacted — compare like with like.
+            if redact(title).lower() in seen_titles:
                 continue
             _spawn(_capture_commitment(
                 call_sid, session.caller, title, str(event.get("when", ""))
@@ -714,7 +731,10 @@ async def api_memories_add(payload: dict):
     memory_type = str(payload.get("memory_type", MemoryType.PREFERENCE))
     if memory_type not in MemoryType.ALL:
         raise HTTPException(status_code=422, detail=f"memory_type must be one of {MemoryType.ALL}")
-    topics = [str(t) for t in payload.get("topics", []) if t]
+    raw_topics = payload.get("topics", [])
+    if not isinstance(raw_topics, list):
+        raise HTTPException(status_code=422, detail="topics must be a list")
+    topics = [str(t) for t in raw_topics if t]
     m = await memory.remember(
         content,
         memory_type=memory_type,

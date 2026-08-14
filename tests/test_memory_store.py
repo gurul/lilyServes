@@ -134,6 +134,32 @@ def test_events_migration_from_pre_link_schema(tmp_path):
     asyncio.run(run())
 
 
+def test_twin_consistency_helpers(store):
+    async def run():
+        e1 = await store.add_event("CA1", "+15551", "Pharmacy pickup", "Friday",
+                                   memory_id="memA")
+        await store.add_event("CA1", "+15551", "Call the doctor", "", memory_id="memB")
+        # A merged duplicate repoints its event at the survivor...
+        await store.remap_event_memory("memB", "memA")
+        assert all(e["memory_id"] == "memA" for e in await store.events_for_call("CA1"))
+        # ...and a retired commitment closes every linked open event.
+        await store.complete_event_by_memory("memA")
+        assert await store.open_events() == []
+        # Idempotent and safe on empty/unknown ids.
+        await store.complete_event_by_memory("")
+        await store.remap_event_memory("", "x")
+        assert await store.complete_event(e1) == "memA"
+    asyncio.run(run())
+
+
+def test_sanitize_summary_handles_malformed_model_output():
+    from lily.summarizer import sanitize_summary
+    bad = {"summary": None, "facts": None, "events": "not-a-list", "risk_level": 3}
+    clean = sanitize_summary(bad)
+    assert clean["facts"] == [] and clean["events"] == []
+    assert isinstance(clean["summary"], str) and isinstance(clean["risk_level"], str)
+
+
 def test_transcript_retention_flag(tmp_path):
     s = MemoryStore(str(tmp_path), retain_transcripts=True)
 

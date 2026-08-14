@@ -46,6 +46,17 @@ _FALLBACK = {
 }
 
 
+def sanitize_summary(result: dict) -> dict:
+    """Enforce the summary contract on model output. json_object mode doesn't
+    enforce a schema — explicit nulls and wrong-typed lists must not crash
+    the finalize path."""
+    for key, default in _FALLBACK.items():
+        value = result.get(key)
+        if value is None or not isinstance(value, type(default)):
+            result[key] = default
+    return result
+
+
 async def generate_summary(transcript_lines: list[str]) -> dict:
     """Structured post-call analysis. Never raises; returns a fallback dict."""
     if not transcript_lines:
@@ -64,9 +75,7 @@ async def generate_summary(transcript_lines: list[str]) -> dict:
             timeout=20.0,
         )
         result = json.loads(response.choices[0].message.content or "{}")
-        for key, default in _FALLBACK.items():
-            result.setdefault(key, default)
-        return result
+        return sanitize_summary(result)
     except Exception as e:
         log.warning("summary generation failed: %s", e)
         fallback = dict(_FALLBACK)
