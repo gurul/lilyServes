@@ -78,6 +78,8 @@ class MemoryDB:
         self.fts_enabled = False
         # In-process vector index: parallel lists kept in insert order.
         self._vec_ids: list[str] = []
+        self._vec_callers: list[str] = []
+        self._vec_types: list[str] = []
         self._vectors: np.ndarray | None = None  # unit-normalized rows
 
     # ----- lifecycle ---------------------------------------------------------
@@ -113,9 +115,10 @@ class MemoryDB:
 
     def _load_vectors(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
-            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
+            "SELECT id, caller, memory_type, embedding FROM memories "
+            "WHERE embedding IS NOT NULL"
         ).fetchall()
-        ids, mats, bad = [], [], []
+        ids, callers, types, mats, bad = [], [], [], [], []
         dim = None
         for row in rows:
             blob = row["embedding"]
@@ -134,6 +137,8 @@ class MemoryDB:
                 bad.append(row["id"])
                 continue
             ids.append(row["id"])
+            callers.append(row["caller"] or "")
+            types.append(row["memory_type"])
             mats.append(vec / norm)
         if bad:
             # NULL the unreadable blobs so the rows lazily re-embed instead of
@@ -144,6 +149,8 @@ class MemoryDB:
             conn.commit()
             log.warning("dropped %d unreadable embeddings; they will re-embed", len(bad))
         self._vec_ids = ids
+        self._vec_callers = callers
+        self._vec_types = types
         self._vectors = np.vstack(mats) if mats else None
         log.info("loaded %d memory vectors", len(ids))
 
@@ -195,15 +202,19 @@ class MemoryDB:
                 "UPDATE memories SET embedding = ? WHERE id = ?", (blob, memory_id)
             )
             conn.commit()
-            return cur.rowcount
+            if not cur.rowcount:
+                return None
+            return conn.execute(
+                "SELECT caller, memory_type FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
 
         vec = np.asarray(vector, dtype=np.float32)
         norm = np.linalg.norm(vec)
         # DB write and index mutation share one critical section so a
         # concurrent delete() can never leave a ghost vector in RAM.
         async with self._lock:
-            updated = await asyncio.to_thread(w, self._conn_or_raise())
-            if not updated or norm == 0:
+            row = await asyncio.to_thread(w, self._conn_or_raise())
+            if row is None or norm == 0:
                 return  # memory deleted before the embedding landed, or degenerate
             vec = vec / norm
             if self._vectors is not None and vec.shape[0] != self._vectors.shape[1]:
@@ -219,9 +230,13 @@ class MemoryDB:
                 self._vectors = replaced
             elif self._vectors is None:
                 self._vec_ids.append(memory_id)
+                self._vec_callers.append(row["caller"] or "")
+                self._vec_types.append(row["memory_type"])
                 self._vectors = vec.reshape(1, -1)
             else:
                 self._vec_ids.append(memory_id)
+                self._vec_callers.append(row["caller"] or "")
+                self._vec_types.append(row["memory_type"])
                 self._vectors = np.vstack([self._vectors, vec])
 
     def _evict_vector_locked(self, memory_id: str) -> None:
@@ -229,6 +244,8 @@ class MemoryDB:
         if memory_id in self._vec_ids:
             idx = self._vec_ids.index(memory_id)
             self._vec_ids.pop(idx)
+            self._vec_callers.pop(idx)
+            self._vec_types.pop(idx)
             if self._vectors is not None:
                 self._vectors = np.delete(self._vectors, idx, axis=0)
                 if self._vectors.shape[0] == 0:
@@ -328,10 +345,32 @@ class MemoryDB:
         terms = [t.replace('"', "") for t in query.split()]
         return " OR ".join(f'"{t}"' for t in terms if t)
 
-    async def lexical_search(self, query: str, limit: int = 25) -> list[tuple[str, float]]:
+    @staticmethod
+    def _scope_clause(caller: str, memory_types: list[str] | None) -> tuple[str, list]:
+        """SQL predicate limiting rows to a caller scope and/or memory types.
+
+        Unattributed memories (caller='') are visible in every caller scope.
+        """
+        sql, params = "", []
+        if caller:
+            sql += " AND (m.caller = '' OR m.caller = ?)"
+            params.append(caller)
+        if memory_types:
+            sql += f" AND m.memory_type IN ({','.join('?' * len(memory_types))})"
+            params.extend(memory_types)
+        return sql, params
+
+    async def lexical_search(
+        self,
+        query: str,
+        limit: int = 25,
+        caller: str = "",
+        memory_types: list[str] | None = None,
+    ) -> list[tuple[str, float]]:
         """Return (memory_id, lexical_score 0..1) — best match first."""
         if not query.strip():
             return []
+        scope_sql, scope_params = self._scope_clause(caller, memory_types)
 
         if self.fts_enabled:
             match = self._fts_quote(query)
@@ -341,10 +380,12 @@ class MemoryDB:
             def q(conn: sqlite3.Connection):
                 return conn.execute(
                     "SELECT m.id, m.content, m.entities, m.topics, "
-                    "bm25(memories_fts) AS rank "
+                    # Column weights: a hit on entities (who) beats topics
+                    # (what kind) beats content prose.
+                    "bm25(memories_fts, 1.0, 3.0, 2.0) AS rank "
                     "FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid "
-                    "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (match, limit),
+                    f"WHERE memories_fts MATCH ?{scope_sql} ORDER BY rank LIMIT ?",
+                    [match, *scope_params, limit],
                 ).fetchall()
 
             try:
@@ -375,11 +416,13 @@ class MemoryDB:
             return []
 
         def q_like(conn: sqlite3.Connection):
-            where = " OR ".join("lower(content) LIKE ?" for _ in terms)
+            where = " OR ".join("lower(m.content) LIKE ?" for _ in terms)
             params = ["%" + t + "%" for t in terms]
+            params.extend(scope_params)
             params.append(limit * 4)
             return conn.execute(
-                f"SELECT id, content FROM memories WHERE {where} LIMIT ?", params
+                f"SELECT m.id, m.content FROM memories m WHERE ({where}){scope_sql} LIMIT ?",
+                params,
             ).fetchall()
 
         rows = await self._run(q_like)
@@ -394,12 +437,20 @@ class MemoryDB:
 
     # ----- semantic search ---------------------------------------------------
 
-    async def vector_search(self, query_vec: list[float], limit: int = 25) -> list[tuple[str, float]]:
+    async def vector_search(
+        self,
+        query_vec: list[float],
+        limit: int = 25,
+        caller: str = "",
+        memory_types: list[str] | None = None,
+    ) -> list[tuple[str, float]]:
         """Return (memory_id, raw cosine -1..1) — best match first."""
         async with self._lock:
             if self._vectors is None:
                 return []
             ids = list(self._vec_ids)
+            callers = np.array(self._vec_callers)
+            types = np.array(self._vec_types)
             matrix = self._vectors
 
         vec = np.asarray(query_vec, dtype=np.float32)
@@ -409,5 +460,22 @@ class MemoryDB:
         if norm == 0:
             return []
         sims = matrix @ (vec / norm)  # rows are unit vectors -> cosine
+        # Scope inside the index, not post-hoc, so filtered searches can't be
+        # starved by the global top-k.
+        if caller:
+            sims = np.where((callers == caller) | (callers == ""), sims, -np.inf)
+        if memory_types:
+            sims = np.where(np.isin(types, memory_types), sims, -np.inf)
         top = np.argsort(sims)[::-1][:limit]
-        return [(ids[i], float(sims[i])) for i in top]
+        return [(ids[i], float(sims[i])) for i in top if np.isfinite(sims[i])]
+
+    async def get_vectors(self, memory_ids: list[str]) -> dict[str, np.ndarray]:
+        """Unit vectors for the given ids (missing/vectorless ids omitted)."""
+        async with self._lock:
+            if self._vectors is None:
+                return {}
+            out = {}
+            for mid in memory_ids:
+                if mid in self._vec_ids:
+                    out[mid] = self._vectors[self._vec_ids.index(mid)]
+            return out
