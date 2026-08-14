@@ -1,8 +1,10 @@
 import asyncio
+import sqlite3
+import time
 
 import pytest
 
-from lily.memory import Memory, MemoryService, MemoryType
+from lily.memory import Memory, MemoryService, MemoryStatus, MemoryType, lifecycle
 
 
 class FakeEmbedder:
@@ -299,6 +301,186 @@ def test_recall_deduplicates_near_identical_memories(svc):
         contents = [m["content"] for m in results]
         assert contents.count("Tom stopped by to check in") == 1
         assert any("Pharmacy pickup" in c for c in contents)
+    asyncio.run(run())
+
+
+# ----- lifecycle -------------------------------------------------------------
+
+
+_OLD_SCHEMA = """
+CREATE TABLE memories (
+    id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, content TEXT NOT NULL,
+    entities TEXT DEFAULT '[]', topics TEXT DEFAULT '[]',
+    importance REAL DEFAULT 0.5, confidence REAL DEFAULT 0.8,
+    caller TEXT DEFAULT '', call_sid TEXT DEFAULT '',
+    created_at REAL, last_recalled REAL DEFAULT 0,
+    recall_count INTEGER DEFAULT 0, embedding BLOB
+);
+"""
+
+
+def test_migration_from_pre_lifecycle_schema(tmp_path):
+    db_path = tmp_path / "lily_memory.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO memories (id, memory_type, content, created_at) "
+        "VALUES ('legacy1', 'episode', 'Pharmacy pickup Friday', ?)",
+        (time.time(),),
+    )
+    conn.commit()
+    conn.close()
+
+    service = MemoryService(str(tmp_path), embedder=FakeEmbedder())
+
+    async def run():
+        await service.open()  # guarded ALTERs must upgrade in place
+        got = await service.db.get("legacy1")
+        assert got is not None and got.status == MemoryStatus.ACTIVE
+        assert got.source_count == 1 and got.expires_at == 0
+        results = await service.recall("pharmacy pickup friday")
+        assert results and results[0]["id"] == "legacy1"
+        await service.close()
+    asyncio.run(run())
+
+
+def test_superseded_memory_hidden_but_auditable(svc):
+    async def run():
+        old = await svc.remember("Lives on Maple Street", MemoryType.PERSON,
+                                 caller="+15551110000")
+        await _drain(svc)()
+        await svc.db.set_status(old.id, MemoryStatus.SUPERSEDED, "newid")
+        assert await svc.recall("maple street") == []
+        got = await svc.db.get(old.id)  # audit reads still see everything
+        assert got.status == MemoryStatus.SUPERSEDED
+        assert got.superseded_by == "newid"
+        assert await svc.forget(old.id) is True  # privacy promise unchanged
+    asyncio.run(run())
+
+
+def test_duplicate_reinforces_instead_of_duplicating(svc):
+    async def run():
+        first = await svc.remember("Grandson called about lunch on Friday",
+                                   MemoryType.EPISODE, importance=0.5)
+        await _drain(svc)()
+        await svc.remember("Grandson called about lunch on Friday",
+                           MemoryType.EPISODE, importance=0.5)
+        await _drain(svc)()
+        assert await svc.count() == 1
+        got = await svc.db.get(first.id)
+        assert got.source_count == 2
+        assert got.importance > 0.5
+    asyncio.run(run())
+
+
+def test_duplicate_reinforces_lexically_without_embeddings(tmp_path):
+    service = MemoryService(str(tmp_path), embedder=FailingEmbedder())
+
+    async def run():
+        await service.open()
+        await service.remember("Grandson called about lunch on Friday")
+        await _drain(service)()
+        await service.remember("Grandson called about lunch on Friday")
+        await _drain(service)()
+        assert await service.count() == 1
+        await service.close()
+    asyncio.run(run())
+
+
+def test_reschedule_supersedes_old_commitment(svc):
+    async def run():
+        old = await svc.remember_commitment("CA1", "+15551110000",
+                                            "Pharmacy pickup", "Friday at 4 pm")
+        await _drain(svc)()
+        new = await svc.remember_commitment("CA2", "+15551110000",
+                                            "Pharmacy pickup", "Saturday at 10 am")
+        await _drain(svc)()
+        old_row = await svc.db.get(old.id)
+        assert old_row.status == MemoryStatus.SUPERSEDED
+        assert old_row.superseded_by == new.id
+        results = await svc.recall("pharmacy pickup", caller="+15551110000")
+        assert [m["id"] for m in results] == [new.id]
+    asyncio.run(run())
+
+
+def test_retrust_replaces_person_fact(svc):
+    async def run():
+        await svc.remember_person("+15551110000", "Susan")
+        await _drain(svc)()
+        new = await svc.remember_person("+15551110000", "Susan",
+                                        "daughter, calls every Sunday")
+        await _drain(svc)()
+        results = await svc.recall("susan contact", caller="+15551110000")
+        ids = [m["id"] for m in results]
+        assert new.id in ids and len(ids) == 1
+    asyncio.run(run())
+
+
+def test_resolve_when():
+    ref = time.mktime((2026, 8, 12, 12, 0, 0, -1, -1, -1))  # a Wednesday noon
+    friday = lifecycle.resolve_when("Friday at 4 pm", ref)
+    assert time.localtime(friday).tm_wday == 4
+    assert time.localtime(friday).tm_hour == 16
+    tomorrow = lifecycle.resolve_when("tomorrow", ref)
+    assert time.localtime(tomorrow).tm_mday == 13
+    march = lifecycle.resolve_when("March 5", ref)
+    assert time.localtime(march).tm_year == 2027  # already passed → rolls over
+    numeric = lifecycle.resolve_when("9/1 at 10 am", ref)
+    assert time.localtime(numeric).tm_mon == 9
+    assert lifecycle.resolve_when("whenever works", ref) is None
+    assert lifecycle.resolve_when("", ref) is None
+
+
+def test_expired_commitment_leaves_recall(svc):
+    async def run():
+        m = await svc.remember("Pharmacy pickup", MemoryType.COMMITMENT,
+                               expires_at=time.time() - 3600)
+        await _drain(svc)()
+        await svc._sweep(time.time())
+        assert await svc.recall("pharmacy pickup") == []
+        got = await svc.db.get(m.id)
+        assert got.status == MemoryStatus.EXPIRED
+        # Audit view still shows it.
+        audit = await svc.recent(include_inactive=True)
+        assert any(d["id"] == m.id for d in audit)
+    asyncio.run(run())
+
+
+def test_purge_respects_retention_and_safety_exemption(svc):
+    async def run():
+        ep = await svc.remember("Old expired chatter", MemoryType.EPISODE)
+        sf = await svc.remember("Gift card scam attempt", MemoryType.SAFETY)
+        await _drain(svc)()
+        long_ago = time.time() - 200 * 86400
+
+        def backdate(conn):
+            conn.execute(
+                "UPDATE memories SET status = 'expired', updated_at = ?", (long_ago,)
+            )
+            conn.commit()
+        await svc.db._run(backdate)
+
+        await svc._sweep(time.time())
+        assert await svc.db.get(ep.id) is None       # purged from disk
+        assert await svc.db.get(sf.id) is not None   # scam history is immortal
+    asyncio.run(run())
+
+
+def test_due_soon_commitment_outranks_distant_one():
+    now = time.time()
+    soon = Memory(content="Pickup", memory_type=MemoryType.COMMITMENT,
+                  created_at=now - 86400, expires_at=now + 86400)
+    distant = Memory(content="Pickup", memory_type=MemoryType.COMMITMENT,
+                     created_at=now, expires_at=now + 21 * 86400)
+    assert MemoryService._recency(soon, now) > MemoryService._recency(distant, now)
+
+
+def test_completed_commitment_expires(svc):
+    async def run():
+        m = await svc.remember_commitment("CA1", "+15551", "Pharmacy pickup", "Friday")
+        await _drain(svc)()
+        assert await svc.complete_commitment(m.id) is True
+        assert await svc.recall("pharmacy pickup") == []
     asyncio.run(run())
 
 

@@ -12,8 +12,9 @@ import logging
 import math
 import time
 
+from lily.memory import lifecycle
 from lily.memory.embeddings import NullEmbedder, OpenAIEmbedder
-from lily.memory.models import Memory, MemoryType
+from lily.memory.models import Memory, MemoryStatus, MemoryType
 from lily.memory.operational import redact
 from lily.memory.store import MemoryDB
 
@@ -44,6 +45,13 @@ RECENCY_FLOOR = 0.05
 MMR_LAMBDA = 0.75
 DUP_SIM = 0.97
 
+# Lazy maintenance sweep cadence and how long retired rows stay auditable
+# before they are purged from disk.
+SWEEP_INTERVAL = 3600.0
+RETENTION_DAYS = 180.0
+# A commitment's salience peaks at its due date and falls off over ±3 days.
+URGENCY_SCALE_DAYS = 3.0
+
 # Cosine calibration anchors for text-embedding-3-small@512: below the floor
 # is noise, above the ceiling is a near-duplicate.
 COS_FLOOR = 0.25
@@ -62,6 +70,7 @@ class MemoryService:
         self.embedder = embedder if embedder is not None else OpenAIEmbedder()
         self._bg_tasks: set[asyncio.Task] = set()
         self._closing = False
+        self._last_sweep = 0.0
 
     @classmethod
     def lexical_only(cls, data_dir: str) -> MemoryService:
@@ -78,12 +87,21 @@ class MemoryService:
 
     async def open(self) -> None:
         await self.db.open()
+        await self._sweep(time.time())
         # Heal rows written while the embedder was down.
         missing = await self.db.missing_embedding_ids()
         if missing:
             memories = await self.db.get_many(missing)
             for memory in memories.values():
                 self._track(self._embed_and_store(memory))
+
+    async def _sweep(self, now: float) -> None:
+        """Expire past-due memories and purge long-retired rows."""
+        self._last_sweep = now
+        expired = await self.db.expire_due(now)
+        purged = await self.db.purge_dead(now - RETENTION_DAYS * 86400.0)
+        if expired or purged:
+            log.info("sweep: expired %d, purged %d", len(expired), purged)
 
     async def close(self) -> None:
         self._closing = True
@@ -103,6 +121,7 @@ class MemoryService:
         confidence: float = 0.8,
         caller: str = "",
         call_sid: str = "",
+        expires_at: float | None = None,
     ) -> Memory:
         """Store a memory. Returns immediately; the embedding lands async."""
         memory = Memory(
@@ -115,6 +134,11 @@ class MemoryService:
             caller=caller,
             call_sid=call_sid,
         )
+        memory.expires_at = (
+            expires_at if expires_at is not None
+            else lifecycle.default_expiry(memory.memory_type, memory.importance,
+                                          memory.created_at)
+        )
         await self.db.insert(memory)
         self._track(self._embed_and_store(memory))
         log.info("remembered %s memory %s", memory.memory_type, memory.id[:8])
@@ -124,6 +148,12 @@ class MemoryService:
         vectors = await self.embedder.embed([memory.content])
         if vectors:
             await self.db.set_embedding(memory.id, vectors[0])
+        # Post-write hygiene runs off the hot path: reinforce duplicates,
+        # supersede changed facts (lexical-only when embeddings are down).
+        try:
+            await lifecycle.maintain(self, memory, vectors[0] if vectors else None)
+        except Exception:
+            log.exception("lifecycle maintenance failed for %s", memory.id[:8])
 
     async def forget(self, memory_id: str) -> bool:
         """Delete a memory — "You own your data. Always." """
@@ -142,6 +172,9 @@ class MemoryService:
         """Hybrid recall: cosine + BM25 + importance + recency, fused."""
         if not query.strip():
             return []
+        if time.time() - self._last_sweep > SWEEP_INTERVAL:
+            self._last_sweep = time.time()
+            self._track(self._sweep(self._last_sweep))
         candidate_limit = max(limit * 5, 25)
 
         query_vec = None
@@ -166,6 +199,8 @@ class MemoryService:
         now = time.time()
         ranked: list[tuple[float, Memory]] = []
         for mid, memory in memories.items():
+            if memory.status != MemoryStatus.ACTIVE:
+                continue
             lex = lexical.get(mid, 0.0)
             if query_vec is not None:
                 cos = semantic.get(mid, 0.0)
@@ -198,6 +233,10 @@ class MemoryService:
     def _recency(memory: Memory, now: float) -> float:
         """Type-aware freshness, anchored to the last recall so memories the
         user keeps coming back to stay warm."""
+        if memory.memory_type == MemoryType.COMMITMENT and memory.expires_at > 0:
+            # Urgency curve: salience peaks at the due date, not at creation.
+            days_out = abs(memory.expires_at - now) / 86400.0
+            return max(RECENCY_FLOOR, math.exp(-days_out / URGENCY_SCALE_DAYS))
         half = RECENCY_HALF_LIFE.get(memory.memory_type, RECENCY_DEFAULT_HALF_LIFE)
         if half is None:
             return 1.0
@@ -243,8 +282,17 @@ class MemoryService:
             remaining = [r for i, r in enumerate(remaining) if i not in drop]
         return selected
 
-    async def recent(self, limit: int = 50, memory_type: str = "", caller: str = "") -> list[dict]:
-        return [m.to_dict() for m in await self.db.recent(limit, memory_type, caller)]
+    async def recent(
+        self,
+        limit: int = 50,
+        memory_type: str = "",
+        caller: str = "",
+        include_inactive: bool = False,
+    ) -> list[dict]:
+        return [
+            m.to_dict()
+            for m in await self.db.recent(limit, memory_type, caller, include_inactive)
+        ]
 
     async def count(self) -> int:
         return await self.db.count()
@@ -279,6 +327,7 @@ class MemoryService:
         self, call_sid: str, caller: str, title: str, when: str
     ) -> Memory:
         content = title + (f" — {when}" if when else "")
+        due = lifecycle.resolve_when(when)
         return await self.remember(
             content,
             memory_type=MemoryType.COMMITMENT,
@@ -287,11 +336,16 @@ class MemoryService:
             importance=0.8,
             caller=caller,
             call_sid=call_sid,
+            expires_at=(due + lifecycle.COMMITMENT_GRACE) if due else None,
         )
+
+    async def complete_commitment(self, memory_id: str) -> bool:
+        """A done commitment leaves recall and the profile card immediately."""
+        return await self.db.set_status(memory_id, MemoryStatus.EXPIRED)
 
     async def remember_person(self, number: str, name: str, note: str = "") -> Memory:
         content = f"{name} ({number})" + (f": {note}" if note else " is a trusted contact.")
-        return await self.remember(
+        memory = await self.remember(
             content,
             memory_type=MemoryType.PERSON,
             entities=[name, number],
@@ -300,3 +354,9 @@ class MemoryService:
             confidence=1.0,
             caller=number,
         )
+        # caller + PERSON is an identity key: re-trusting with a new name or
+        # note deterministically replaces the previous fact.
+        for old in await self.db.recent(20, MemoryType.PERSON, number):
+            if old.id != memory.id:
+                await self.db.set_status(old.id, MemoryStatus.SUPERSEDED, memory.id)
+        return memory

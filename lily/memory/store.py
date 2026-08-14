@@ -9,9 +9,11 @@ an in-process numpy matrix so cosine search never touches the disk.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
+import time
 
 import numpy as np
 
@@ -39,12 +41,27 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at   REAL,
     last_recalled REAL DEFAULT 0,
     recall_count INTEGER DEFAULT 0,
-    embedding    BLOB
+    embedding    BLOB,
+    status       TEXT DEFAULT 'active',
+    superseded_by TEXT DEFAULT '',
+    expires_at   REAL DEFAULT 0,
+    source_count INTEGER DEFAULT 1,
+    updated_at   REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_caller ON memories(caller);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
 """
+
+# Lifecycle columns arrived after the first release; existing DBs are
+# upgraded in place (SQLite backfills the constant defaults).
+_MIGRATIONS = (
+    ("status", "ALTER TABLE memories ADD COLUMN status TEXT DEFAULT 'active'"),
+    ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT DEFAULT ''"),
+    ("expires_at", "ALTER TABLE memories ADD COLUMN expires_at REAL DEFAULT 0"),
+    ("source_count", "ALTER TABLE memories ADD COLUMN source_count INTEGER DEFAULT 1"),
+    ("updated_at", "ALTER TABLE memories ADD COLUMN updated_at REAL DEFAULT 0"),
+)
 
 _FTS_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -90,6 +107,15 @@ class MemoryDB:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
+        for col, ddl in _MIGRATIONS:
+            if col not in cols:
+                conn.execute(ddl)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_caller_type ON memories(caller, memory_type)"
+        )
+        conn.commit()
         try:
             conn.executescript(_FTS_SCHEMA)
             self.fts_enabled = True
@@ -116,7 +142,7 @@ class MemoryDB:
     def _load_vectors(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
             "SELECT id, caller, memory_type, embedding FROM memories "
-            "WHERE embedding IS NOT NULL"
+            "WHERE embedding IS NOT NULL AND status = 'active'"
         ).fetchall()
         ids, callers, types, mats, bad = [], [], [], [], []
         dim = None
@@ -187,7 +213,8 @@ class MemoryDB:
             conn.execute(
                 "INSERT INTO memories (id, memory_type, content, entities, topics, "
                 "importance, confidence, caller, call_sid, created_at, last_recalled, "
-                "recall_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "recall_count, status, superseded_by, expires_at, source_count, "
+                "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 memory.to_row(),
             )
             conn.commit()
@@ -301,10 +328,18 @@ class MemoryDB:
         rows = await self._run(q)
         return {row["id"]: Memory.from_row(row) for row in rows}
 
-    async def recent(self, limit: int = 50, memory_type: str = "", caller: str = "") -> list[Memory]:
+    async def recent(
+        self,
+        limit: int = 50,
+        memory_type: str = "",
+        caller: str = "",
+        include_inactive: bool = False,
+    ) -> list[Memory]:
         def q(conn: sqlite3.Connection):
             sql = "SELECT * FROM memories"
             clauses, params = [], []
+            if not include_inactive:
+                clauses.append("status = 'active'")
             if memory_type:
                 clauses.append("memory_type = ?")
                 params.append(memory_type)
@@ -331,7 +366,8 @@ class MemoryDB:
         def q(conn: sqlite3.Connection):
             return [
                 r["id"] for r in conn.execute(
-                    "SELECT id FROM memories WHERE embedding IS NULL LIMIT ?", (limit,)
+                    "SELECT id FROM memories WHERE embedding IS NULL "
+                    "AND status = 'active' LIMIT ?", (limit,)
                 ).fetchall()
             ]
 
@@ -384,7 +420,8 @@ class MemoryDB:
                     # (what kind) beats content prose.
                     "bm25(memories_fts, 1.0, 3.0, 2.0) AS rank "
                     "FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid "
-                    f"WHERE memories_fts MATCH ?{scope_sql} ORDER BY rank LIMIT ?",
+                    f"WHERE memories_fts MATCH ? AND m.status = 'active'{scope_sql} "
+                    "ORDER BY rank LIMIT ?",
                     [match, *scope_params, limit],
                 ).fetchall()
 
@@ -421,7 +458,8 @@ class MemoryDB:
             params.extend(scope_params)
             params.append(limit * 4)
             return conn.execute(
-                f"SELECT m.id, m.content FROM memories m WHERE ({where}){scope_sql} LIMIT ?",
+                f"SELECT m.id, m.content FROM memories m "
+                f"WHERE ({where}) AND m.status = 'active'{scope_sql} LIMIT ?",
                 params,
             ).fetchall()
 
@@ -479,3 +517,159 @@ class MemoryDB:
                 if mid in self._vec_ids:
                     out[mid] = self._vectors[self._vec_ids.index(mid)]
             return out
+
+    # ----- lifecycle ---------------------------------------------------------
+
+    async def set_status(self, memory_id: str, status: str, superseded_by: str = "") -> bool:
+        """Retire (or reactivate) a memory. Non-active rows leave the search
+        index but keep their embedding, so reactivation needs no re-embed."""
+        now = time.time()
+
+        def w(conn: sqlite3.Connection):
+            cur = conn.execute(
+                "UPDATE memories SET status = ?, superseded_by = ?, updated_at = ? "
+                "WHERE id = ?",
+                (status, superseded_by, now, memory_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+        async with self._lock:
+            changed = await asyncio.to_thread(w, self._conn_or_raise())
+            if changed and status != "active":
+                self._evict_vector_locked(memory_id)
+        return changed
+
+    async def similarity_to(self, memory_ids: list[str], vector: list[float]) -> dict[str, float]:
+        """Cosine of `vector` against just the given ids' index rows."""
+        vec = np.asarray(vector, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            return {}
+        vec = vec / norm
+        async with self._lock:
+            if self._vectors is None or self._vectors.shape[1] != vec.shape[0]:
+                return {}
+            out = {}
+            for mid in memory_ids:
+                if mid in self._vec_ids:
+                    out[mid] = float(self._vectors[self._vec_ids.index(mid)] @ vec)
+            return out
+
+    async def reinforce(
+        self,
+        memory_id: str,
+        content: str,
+        importance: float,
+        confidence: float,
+        entities: list[str],
+        topics: list[str],
+        now: float,
+    ) -> bool:
+        """A repeated observation strengthens the existing memory instead of
+        duplicating it: bump importance, union tags, keep the richer content.
+        Returns False when the target no longer exists."""
+        def w(conn: sqlite3.Connection):
+            row = conn.execute(
+                "SELECT content, importance, confidence, entities, topics, source_count "
+                "FROM memories WHERE id = ? AND status = 'active'", (memory_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            merged_entities = list(dict.fromkeys(json.loads(row["entities"] or "[]") + entities))
+            merged_topics = list(dict.fromkeys(json.loads(row["topics"] or "[]") + topics))
+            conn.execute(
+                "UPDATE memories SET content = ?, importance = ?, confidence = ?, "
+                "entities = ?, topics = ?, source_count = source_count + 1, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    content if len(content) > len(row["content"]) else row["content"],
+                    min(1.0, max(row["importance"], importance) + 0.05),
+                    max(row["confidence"], confidence),
+                    json.dumps(merged_entities),
+                    json.dumps(merged_topics),
+                    now,
+                    memory_id,
+                ),
+            )
+            conn.commit()
+            return True
+
+        return await self._run(w)
+
+    async def expire_due(self, now: float) -> list[str]:
+        """Flip past-due active memories to 'expired' and evict their vectors."""
+        def w(conn: sqlite3.Connection):
+            ids = [
+                r["id"] for r in conn.execute(
+                    "SELECT id FROM memories WHERE status = 'active' "
+                    "AND expires_at > 0 AND expires_at < ?", (now,)
+                ).fetchall()
+            ]
+            if ids:
+                conn.executemany(
+                    "UPDATE memories SET status = 'expired', updated_at = ? WHERE id = ?",
+                    [(now, mid) for mid in ids],
+                )
+                conn.commit()
+            return ids
+
+        async with self._lock:
+            expired = await asyncio.to_thread(w, self._conn_or_raise())
+            for mid in expired:
+                self._evict_vector_locked(mid)
+        return expired
+
+    async def purge_dead(self, cutoff: float) -> int:
+        """Hard-delete long-retired rows — retired means eventually gone from
+        disk. SAFETY rows are exempt: scam history is the product."""
+        def w(conn: sqlite3.Connection):
+            cur = conn.execute(
+                "DELETE FROM memories WHERE status IN ('expired','superseded') "
+                "AND updated_at < ? AND memory_type != 'safety'", (cutoff,)
+            )
+            conn.commit()
+            return cur.rowcount
+
+        return await self._run(w)
+
+    async def profile_rows(self, caller: str, now: float) -> dict:
+        """One round-trip powering the caller profile card: stable facts, open
+        commitments, recent history, safety record. Pure indexed SQL."""
+        def q(conn: sqlite3.Connection):
+            facts = conn.execute(
+                "SELECT * FROM memories WHERE status = 'active' "
+                "AND memory_type IN ('person','preference') "
+                "AND (caller = ? OR caller = '') "
+                "ORDER BY importance DESC, created_at DESC LIMIT 8",
+                (caller,),
+            ).fetchall()
+            commitments = conn.execute(
+                "SELECT * FROM memories WHERE status = 'active' "
+                "AND memory_type = 'commitment' "
+                "AND (caller = ? OR caller = '') "
+                "AND (expires_at = 0 OR expires_at > ?) "
+                "ORDER BY CASE WHEN expires_at = 0 THEN 1 ELSE 0 END, "
+                "expires_at ASC LIMIT 5",
+                (caller, now),
+            ).fetchall()
+            recent = conn.execute(
+                "SELECT * FROM memories WHERE status = 'active' "
+                "AND memory_type IN ('episode','win') AND caller = ? "
+                "ORDER BY created_at DESC LIMIT 3",
+                (caller,),
+            ).fetchall()
+            safety = conn.execute(
+                "SELECT * FROM memories WHERE memory_type = 'safety' AND caller = ? "
+                "ORDER BY created_at DESC",
+                (caller,),
+            ).fetchall()
+            return facts, commitments, recent, safety
+
+        facts, commitments, recent, safety = await self._run(q)
+        return {
+            "facts": [Memory.from_row(r) for r in facts],
+            "commitments": [Memory.from_row(r) for r in commitments],
+            "recent": [Memory.from_row(r) for r in recent],
+            "safety": [Memory.from_row(r) for r in safety],
+        }
