@@ -10,7 +10,7 @@ Assistance (commitments that persist), and the family dashboard's memory
 views. Privacy first: everything stored is redacted, and any memory can be
 deleted — you own your data, always.
 """
-from lily.memory.models import Memory, MemoryType
+from lily.memory.models import Memory, MemoryStatus, MemoryType
 from lily.memory.service import MemoryService
 
-__all__ = ["Memory", "MemoryService", "MemoryType"]
+__all__ = ["Memory", "MemoryService", "MemoryStatus", "MemoryType"]

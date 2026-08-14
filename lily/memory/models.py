@@ -29,6 +29,14 @@ class MemoryType:
     ALL = (EPISODE, COMMITMENT, PERSON, PREFERENCE, WIN, SAFETY)
 
 
+class MemoryStatus:
+    ACTIVE = "active"          # live: searchable and recallable
+    SUPERSEDED = "superseded"  # replaced by a newer fact; auditable, not recalled
+    EXPIRED = "expired"        # past its useful life; auditable, not recalled
+
+    ALL = (ACTIVE, SUPERSEDED, EXPIRED)
+
+
 @dataclass
 class Memory:
     content: str
@@ -43,6 +51,11 @@ class Memory:
     created_at: float = field(default_factory=time.time)
     last_recalled: float = 0.0
     recall_count: int = 0
+    status: str = MemoryStatus.ACTIVE
+    superseded_by: str = ""   # id of the memory that replaced this one
+    expires_at: float = 0.0   # epoch seconds; 0 = never expires
+    source_count: int = 1     # how many times this fact has been observed
+    updated_at: float = 0.0   # last lifecycle change (reinforce/supersede/expire)
 
     def to_row(self) -> tuple:
         return (
@@ -51,6 +64,8 @@ class Memory:
             self.importance, self.confidence,
             self.caller, self.call_sid,
             self.created_at, self.last_recalled, self.recall_count,
+            self.status, self.superseded_by, self.expires_at,
+            self.source_count, self.updated_at,
         )
 
     @classmethod
@@ -68,6 +83,11 @@ class Memory:
             created_at=row["created_at"],
             last_recalled=row["last_recalled"],
             recall_count=row["recall_count"],
+            status=row["status"] or MemoryStatus.ACTIVE,
+            superseded_by=row["superseded_by"] or "",
+            expires_at=row["expires_at"] or 0.0,
+            source_count=row["source_count"] or 1,
+            updated_at=row["updated_at"] or 0.0,
         )
 
     def to_dict(self, score: float | None = None) -> dict:
@@ -83,6 +103,10 @@ class Memory:
             "call_sid": self.call_sid,
             "created_at": self.created_at,
             "recall_count": self.recall_count,
+            "status": self.status,
+            "superseded_by": self.superseded_by,
+            "expires_at": self.expires_at,
+            "source_count": self.source_count,
         }
         if score is not None:
             d["score"] = round(score, 4)
