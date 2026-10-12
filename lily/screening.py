@@ -66,15 +66,29 @@ def assess_screen_answer(speech: str) -> tuple[bool, str]:
     """Decide whether a screened caller's answer earns a bridge.
 
     Heuristic-only so the caller isn't left hanging on an LLM round-trip:
-    High risk -> declined; silence/empty -> declined; otherwise bridged
-    (the live call is still transcribed and scored end-to-end).
+    - silence/empty -> declined
+    - High risk -> declined
+    - an impersonation claim (government, bank, law enforcement, utility,
+      tech support) together with a threat, a credential request, or a
+      payment request -> declined, even below High
+    - otherwise bridged (the live call is still transcribed and scored).
     Returns (allow, reason).
     """
+    from lily.detection.heuristics import (
+        CREDENTIAL_SIGNALS,
+        IMPERSONATION_SIGNALS,
+        PAYMENT_SIGNALS,
+        THREAT_SIGNALS,
+    )
+
     text = (speech or "").strip()
     if not text:
         return False, "Caller gave no response to screening"
     result = score_text(text)
-    if result.level == "High":
+    signals = set(result.signals)
+    impersonation = signals & IMPERSONATION_SIGNALS
+    pressure = signals & (THREAT_SIGNALS | CREDENTIAL_SIGNALS | PAYMENT_SIGNALS)
+    if result.level == "High" or (impersonation and pressure):
         return False, "Screening answer matched scam patterns: " + ", ".join(result.signals)
     return True, "Screening answer acceptable"
 
