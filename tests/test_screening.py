@@ -80,3 +80,35 @@ def test_anonymous_with_strikes_is_screened_not_blocked():
         ctx = {"known": True, "scam_strikes": 5, "call_count": 9}
         assert screening.decide_route(caller, ctx, [], True) == screening.ROUTE_SCREEN
     assert screening.is_anonymous("") and screening.is_anonymous(None)
+
+
+def test_screen_answer_irs_warrant_declined():
+    allow, reason = screening.assess_screen_answer(
+        "This is Officer Brown with the IRS. "
+        "There is a warrant for your arrest for unpaid back taxes."
+    )
+    assert allow is False
+    assert "scam patterns" in reason
+
+
+def test_screen_answer_impersonation_plus_threat_declined_below_high():
+    # gov impersonation (3) + bail/legal threat (3) = 6: Medium, still declined.
+    allow, _ = screening.assess_screen_answer(
+        "This is the IRS. There is a warrant for your arrest."
+    )
+    assert allow is False
+
+
+def test_screen_answer_utility_shutoff_with_payment_declined():
+    allow, _ = screening.assess_screen_answer(
+        "This is Con Edison. Your power will be shut off in thirty minutes "
+        "unless you pay the overdue bill."
+    )
+    assert allow is False
+
+
+def test_screen_answer_impersonation_alone_allowed():
+    allow, _ = screening.assess_screen_answer(
+        "Hi, this is your bank's fraud department confirming a purchase."
+    )
+    assert allow is True
