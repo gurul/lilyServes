@@ -6,4 +6,5 @@ python-dotenv
 httpx
 twilio
 python-multipart
-google-cloud-speechnumpy
+google-cloud-speech
+numpy

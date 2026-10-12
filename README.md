@@ -62,7 +62,7 @@ flowchart LR
 
 ## Quick start
 
-Requires Python 3.9+ (3.13 supported — mulaw decode has a pure-Python fallback), a Twilio number, a Google Cloud project with Speech-to-Text enabled, an OpenAI key, and [ngrok](https://ngrok.com) for local development.
+Requires Python 3.10+ (3.13 supported — mulaw decode has a pure-Python fallback), a Twilio number, a Google Cloud project with Speech-to-Text enabled, an OpenAI key, and [ngrok](https://ngrok.com) for local development.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
