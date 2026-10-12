@@ -2,7 +2,7 @@
 import pytest
 
 from lily.detection.fusion import PHI, WINDOW_N, RiskFusion
-from lily.detection.heuristics import score_text
+from lily.detection.heuristics import HeuristicResult, score_text
 
 
 def _feed(fusion, sentences):
@@ -165,3 +165,15 @@ def test_state_is_pure():
     assert first == second
     after = dict(vars(fusion))
     assert after == snapshot
+
+
+def test_threshold_reached_despite_float_rounding():
+    # Exact EWMA is 0.6 (proofs/LilyProofs/Vectors.lean floatGap); float
+    # arithmetic gives 0.5999999999999999 and used to miss the hard alert.
+    f = RiskFusion()
+    f.on_deepfake(0.6)
+    for score in (1, 9, 7):
+        state = f.on_sentence(HeuristicResult("Low", score, []))
+    assert f.ewma < 0.6
+    assert state.hard_alert is True
+    assert state.level == "High"

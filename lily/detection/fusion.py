@@ -40,14 +40,14 @@ Invariants (checked by a formal model; keep these formulas exact):
                 on_llm("scam"): ewma = max(ewma, THETA_ALERT)
                 A convex combination of values in [0, 1], so 0 <= ewma <= 1.
 - Hard alert:   corroborated = payment_marker_seen and |signals_seen| >= 2
-                hard_alert = corroborated or ewma >= THETA_ALERT
+                hard_alert = corroborated or ewma >= THETA_ALERT (within 1e-9)
                              or llm_verdict == "scam"
                 So on_llm("scam") always returns hard_alert = True.
 - Lone marker:  lone = payment_marker_seen and not corroborated
                 cleared = lone and llm_after_marker and llm_verdict == "safe"
                 needs_llm = lone and not llm_after_marker
 - Level:        High   if hard_alert
-                Medium if ewma >= THETA_WARN
+                Medium if ewma >= THETA_WARN (within 1e-9)
                           or (llm_verdict == "uncertain" and signals_seen)
                           or (lone and not cleared)
                 Low    otherwise
@@ -64,6 +64,16 @@ from lily.detection.heuristics import HeuristicResult
 # Dual thresholds on the EWMA-accumulated risk (0..1). Our design choice.
 THETA_WARN = 0.35
 THETA_ALERT = 0.60
+
+# Float slack for threshold checks. The EWMA of exact inputs can land one
+# rounding step below a threshold it reaches exactly (0.5999999999999999
+# for deepfake 0.6 then scores 1, 9, 7 — found by the Lean model in
+# proofs/). Erring by 1e-9 toward alerting is the safe side.
+_EPS = 1e-9
+
+
+def _reaches(value: float, threshold: float) -> bool:
+    return value >= threshold - _EPS
 
 # EWMA window: phi = 2/(T+1) with T fixed at WINDOW_N sentences.
 WINDOW_N = 5
@@ -173,14 +183,14 @@ class RiskFusion:
     def state(self) -> FusionState:
         hard = (
             self._corroborated()
-            or self.ewma >= THETA_ALERT
+            or _reaches(self.ewma, THETA_ALERT)
             or self.llm_verdict == "scam"
         )
         lone = self._lone_marker()
         if hard:
             level = "High"
         elif (
-            self.ewma >= THETA_WARN
+            _reaches(self.ewma, THETA_WARN)
             or (self.llm_verdict == "uncertain" and self._signals_seen)
             or (lone and not self._marker_cleared())
         ):
