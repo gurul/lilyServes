@@ -30,8 +30,16 @@ from fastapi import (
 from fastapi.responses import PlainTextResponse
 
 from lily import screening
-from lily.auth import check_client_token, require_twilio_signature
-from lily.calls import CallSession, registry
+from lily.auth import (
+    check_client_token,
+    install_access_log_filter,
+    require_twilio_signature,
+    stream_param_sig,
+    stream_url,
+    verify_stream_param_sig,
+    verify_twilio_ws_signature,
+)
+from lily.calls import CallExistsError, CallSession, registry
 from lily.config import settings
 from lily.detection.deepfake import check_deepfake, close_http
 from lily.detection.detector import analyze_scam
@@ -48,6 +56,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("lily.server")
+# /ws/client takes ?token= (browsers cannot set WebSocket headers); keep it
+# out of the access log.
+install_access_log_filter()
 
 DEEPFAKE_BUFFER_SIZE = 80_000  # ~10 seconds of mulaw audio at 8 kHz
 
@@ -77,6 +88,8 @@ def _spawn(coro) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    check_exposure()
+    install_access_log_filter()  # again, in case uvicorn reconfigured logging
     await store.open()
     await memory.open()
 
@@ -118,6 +131,28 @@ async def lifespan(app: FastAPI):
         ngrok.disconnect(tunnel.public_url)
 
 
+def check_exposure() -> None:
+    """Refuse to start on a public URL without auth secrets.
+
+    A public URL is PUBLIC_URL, or the ngrok tunnel that opens when it is
+    unset. ALLOW_INSECURE_DEV=true overrides the check for local demos.
+    """
+    exposed = bool(settings.public_url) or settings.ngrok_enabled
+    if not exposed or settings.allow_insecure_dev:
+        return
+    missing = [
+        name for name, value in (
+            ("CLIENT_TOKEN", settings.client_token),
+            ("TWILIO_AUTH_TOKEN", settings.twilio_auth_token),
+        ) if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            f"{' and '.join(missing)} unset while the server is publicly reachable "
+            "(PUBLIC_URL or ngrok). Set them, or set ALLOW_INSECURE_DEV=true for local dev only."
+        )
+
+
 def _configure_twilio_webhook(public_url: str) -> None:
     if not (settings.twilio_account_sid and settings.twilio_auth_token):
         log.warning("Twilio credentials unset — set the voice webhook manually: %s/twiml", public_url)
@@ -140,7 +175,8 @@ app = FastAPI(lifespan=lifespan)
 # ----- Auth dependency for dashboard REST ------------------------------------
 
 async def require_client_token(request: Request) -> None:
-    token = request.headers.get("X-Lily-Token", "") or request.query_params.get("token", "")
+    # Header only: a query-string token lands in access logs and browser history.
+    token = request.headers.get("X-Lily-Token", "")
     if not check_client_token(token):
         raise HTTPException(status_code=403, detail="invalid token")
 
@@ -160,7 +196,12 @@ async def health():
 
 def _ws_url(request: Request) -> str:
     base = request.app.state.public_url or str(request.base_url).rstrip("/")
-    return base.replace("https://", "wss://").replace("http://", "ws://")
+    return stream_url(base, "")
+
+
+def _stream_sig(call_sid: str) -> str:
+    token = settings.twilio_auth_token
+    return stream_param_sig(token, call_sid) if token and call_sid else ""
 
 
 @app.post("/twiml")
@@ -172,7 +213,6 @@ async def twiml(request: Request, form: dict = Depends(require_twilio_signature)
         caller, ctx, settings.trusted_numbers, settings.screen_unknown_callers
     )
     log.info("incoming call from %s -> %s", caller, route)
-    _spawn(store.touch_caller(caller))
 
     if route == screening.ROUTE_BLOCK:
         _spawn(push_activity(
@@ -195,7 +235,12 @@ async def twiml(request: Request, form: dict = Depends(require_twilio_signature)
             screening.twiml_screen(base + "/screen/result"), media_type="application/xml"
         )
 
-    xml = screening.twiml_pass(_ws_url(request), settings.forward_to, caller, screened=False)
+    # call_count counts connected calls only: a caller who hangs up at the
+    # screen must not earn the known-caller pass by redialing.
+    _spawn(store.touch_caller(caller))
+    xml = screening.twiml_pass(
+        _ws_url(request), settings.forward_to, caller, screened=False, sig=_stream_sig(call_sid)
+    )
     return PlainTextResponse(xml, media_type="application/xml")
 
 
@@ -208,7 +253,10 @@ async def screen_result(request: Request, form: dict = Depends(require_twilio_si
     log.info("screen result for %s: allow=%s (%s)", caller, allow, reason)
 
     if not allow:
-        _spawn(store.add_scam_strike(caller))
+        # Withheld caller IDs share one bucket: a strike there would block
+        # every later anonymous caller.
+        if not screening.is_anonymous(caller):
+            _spawn(store.add_scam_strike(caller))
         _spawn(push_activity(
             "stayed_safe",
             "Stayed safe",
@@ -223,14 +271,29 @@ async def screen_result(request: Request, form: dict = Depends(require_twilio_si
         f"Caller said: “{redact(speech)}” — call connected and being monitored.",
         INFO, call_sid, store,
     ))
-    xml = screening.twiml_pass(_ws_url(request), settings.forward_to, caller, screened=True)
+    _spawn(store.touch_caller(caller))
+    xml = screening.twiml_pass(
+        _ws_url(request), settings.forward_to, caller, screened=True, sig=_stream_sig(call_sid)
+    )
     return PlainTextResponse(xml, media_type="application/xml")
 
 
 # ----- Twilio media stream ---------------------------------------------------
 
+_dev_stream_warned = False
+
+
 @app.websocket("/ws/twilio")
 async def twilio_ws(websocket: WebSocket):
+    global _dev_stream_warned
+    # Observe-only: Twilio's docs say the handshake is signed but do not pin
+    # the exact URL form, and a wrong guess here would refuse every real call.
+    # The enforcing control is the per-call HMAC `sig` parameter on `start`.
+    if not verify_twilio_ws_signature(websocket):
+        log.warning("/ws/twilio handshake signature did not verify; relying on start sig")
+    if not settings.twilio_auth_token and not _dev_stream_warned:
+        _dev_stream_warned = True
+        log.warning("TWILIO_AUTH_TOKEN unset — /ws/twilio media streams NOT authenticated")
     await websocket.accept()
     call_sid = None
     try:
@@ -239,12 +302,27 @@ async def twilio_ws(websocket: WebSocket):
             event = msg.get("event")
 
             if event == "start":
+                if call_sid is not None:
+                    log.warning("ignored duplicate start on stream for call_sid=%s", call_sid)
+                    continue
                 start = msg["start"]
-                call_sid = start["callSid"]
+                sid = start["callSid"]
                 params = start.get("customParameters") or {}
+                if not verify_stream_param_sig(sid, params.get("sig", "")):
+                    log.warning("rejected media stream start with bad sig for call_sid=%s", sid)
+                    await websocket.close(code=1008)
+                    return
                 caller = params.get("caller") or "unknown"
                 screened = params.get("screened") == "1"
-                await _begin_call(call_sid, caller, screened)
+                call_sid = sid
+                try:
+                    await _begin_call(call_sid, caller, screened)
+                except CallExistsError:
+                    # Another socket owns this call; never finalize it from here.
+                    log.warning("rejected media stream for already-active call_sid=%s", sid)
+                    call_sid = None
+                    await websocket.close(code=1008)
+                    return
 
             elif event == "media":
                 session = registry.get(call_sid) if call_sid else None
@@ -424,17 +502,25 @@ async def _refine_scam(call_sid: str) -> None:
 
 
 async def _escalate_high_risk(session: CallSession, reason: str) -> None:
-    """Urgent family notification (once per call) and optional intervention."""
-    if session.intervened:
+    """Urgent family notification (once per call) and optional intervention.
+
+    A strike and auto-intervention need the LLM's "scam" verdict. A
+    heuristic-only High still sends the urgent alert, but a regex match
+    alone never strikes a number or ends a call.
+    """
+    if not session.intervened:
+        session.intervened = True
+        await push_activity(
+            "scam_alert",
+            "High scam risk on an active call",
+            f"Caller {session.caller}: {reason}",
+            URGENT, session.call_sid, store,
+        )
+    if session.fusion.llm_verdict != "scam" or session.struck:
         return
-    session.intervened = True
-    _spawn(store.add_scam_strike(session.caller))
-    await push_activity(
-        "scam_alert",
-        "High scam risk on an active call",
-        f"Caller {session.caller}: {reason}",
-        URGENT, session.call_sid, store,
-    )
+    session.struck = True
+    if not screening.is_anonymous(session.caller):
+        _spawn(store.add_scam_strike(session.caller))
     if settings.auto_intervene:
         _spawn(_intervene(session.call_sid))
 

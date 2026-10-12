@@ -28,3 +28,20 @@ def test_client_token_enforced(monkeypatch):
     assert check_client_token("secret123") is True
     assert check_client_token("wrong") is False
     assert check_client_token("") is False
+
+
+def test_client_token_non_ascii_is_rejected_not_raised(monkeypatch):
+    monkeypatch.setattr(settings, "client_token", "secret123")
+    assert check_client_token("é") is False
+    monkeypatch.setattr(settings, "client_token", "sécret")
+    assert check_client_token("sécret") is True
+
+
+def test_stream_param_sig_is_hmac_sha256_hex():
+    import hashlib
+    import hmac
+
+    from lily.auth import stream_param_sig
+
+    expected = hmac.new(b"tok", b"CA123", hashlib.sha256).hexdigest()
+    assert stream_param_sig("tok", "CA123") == expected
