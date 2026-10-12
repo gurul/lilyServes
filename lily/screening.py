@@ -2,7 +2,7 @@
 
 Routing:
 - trusted caller (env allowlist or DB)          -> pass straight through (still monitored)
-- repeat scammer (2+ strikes)                   -> blocked outright
+- repeat scammer (2+ strikes, caller ID shown)  -> blocked outright
 - restricted / anonymous / first-time caller    -> Lily answers, asks who's
   calling, risk-scores the answer, then bridges or politely declines
 
@@ -52,12 +52,15 @@ def decide_route(
         return ROUTE_PASS
     if caller_ctx.get("trusted"):
         return ROUTE_PASS
-    if caller_ctx.get("scam_strikes", 0) >= 2:
-        return ROUTE_BLOCK
+    # Withheld caller IDs share one store bucket, so its strikes say nothing
+    # about this caller: always screen, never block.
     if is_anonymous(number):
         return ROUTE_SCREEN
-    if caller_ctx.get("known") and caller_ctx.get("call_count", 0) > 1:
-        # A caller Lily has spoken with before and never flagged.
+    strikes = caller_ctx.get("scam_strikes", 0) or 0
+    if strikes >= 2:
+        return ROUTE_BLOCK
+    if caller_ctx.get("known") and caller_ctx.get("call_count", 0) > 1 and strikes == 0:
+        # A caller Lily has connected before and never flagged.
         return ROUTE_PASS
     return ROUTE_SCREEN if screen_unknown else ROUTE_PASS
 
@@ -81,18 +84,22 @@ def assess_screen_answer(speech: str) -> tuple[bool, str]:
 
 # ----- TwiML builders --------------------------------------------------------
 
-def twiml_pass(ws_url: str, forward_to: str, caller: str = "", screened: bool = False) -> str:
+def twiml_pass(
+    ws_url: str, forward_to: str, caller: str = "", screened: bool = False, sig: str = ""
+) -> str:
     """Fork caller audio to our WebSocket and bridge the call.
 
     The caller number and screening flag ride along as Stream custom
-    parameters so the media-stream handler doesn't need a DB lookup.
+    parameters so the media-stream handler doesn't need a DB lookup. `sig`
+    (HMAC of the CallSid) lets the handler reject a forged `start` event.
     """
+    sig_param = f'\n      <Parameter name="sig" value="{escape(sig)}" />' if sig else ""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="{escape(ws_url)}/ws/twilio" track="inbound_track">
       <Parameter name="caller" value="{escape(caller, {'"': '&quot;'})}" />
-      <Parameter name="screened" value="{'1' if screened else '0'}" />
+      <Parameter name="screened" value="{'1' if screened else '0'}" />{sig_param}
     </Stream>
   </Start>
   <Dial>{escape(forward_to)}</Dial>

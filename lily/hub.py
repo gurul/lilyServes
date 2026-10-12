@@ -25,6 +25,10 @@ URGENT = "urgent"        # High scam risk, deepfake detected
 
 _NOTIFY_AT = {IMPORTANT, URGENT}
 
+# A client that cannot take a frame in this time is dropped, so one stalled
+# dashboard never delays an urgent alert to the others.
+SEND_TIMEOUT_SECONDS = 2.0
+
 
 class ClientHub:
     def __init__(self) -> None:
@@ -55,7 +59,8 @@ class ClientHub:
         async with self._lock:
             clients = list(self._clients)
         results = await asyncio.gather(
-            *(ws.send_text(text) for ws in clients), return_exceptions=True
+            *(asyncio.wait_for(ws.send_text(text), SEND_TIMEOUT_SECONDS) for ws in clients),
+            return_exceptions=True,
         )
         dead = [ws for ws, r in zip(clients, results) if isinstance(r, BaseException)]
         if dead:

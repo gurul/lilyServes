@@ -38,8 +38,12 @@ class Settings:
     public_url: str = ""
     ngrok_enabled: bool = True
 
-    # Shared secret required (as ?token=) on /ws/client and dashboard REST.
+    # Shared secret: X-Lily-Token header on dashboard REST, ?token= on /ws/client.
     client_token: str = ""
+
+    # A public URL (PUBLIC_URL or ngrok) with an empty CLIENT_TOKEN or
+    # TWILIO_AUTH_TOKEN refuses to start unless this is set.
+    allow_insecure_dev: bool = False
 
     data_dir: str = "data"
     retain_transcripts: bool = False
@@ -76,6 +80,7 @@ class Settings:
             public_url=os.environ.get("PUBLIC_URL", "").rstrip("/"),
             ngrok_enabled=_bool("NGROK_ENABLED", True),
             client_token=os.environ.get("CLIENT_TOKEN", ""),
+            allow_insecure_dev=_bool("ALLOW_INSECURE_DEV", False),
             data_dir=os.environ.get("DATA_DIR", "data"),
             retain_transcripts=_bool("RETAIN_TRANSCRIPTS", False),
             memory_embeddings=_bool("MEMORY_EMBEDDINGS", True),

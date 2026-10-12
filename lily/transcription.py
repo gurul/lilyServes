@@ -131,9 +131,11 @@ class GoogleStreamingSession:
 
     async def _run_stream_loop(self) -> None:
         """Run streaming sessions in a loop, reconnecting as needed."""
-        client = self._get_client()
         while self._is_running:
             try:
+                # Inside the try: a credentials failure retries instead of
+                # killing the task (and with it, finalize via stop()).
+                client = self._get_client()
                 response_stream = await client.streaming_recognize(
                     requests=self._request_generator(),
                 )
@@ -187,4 +189,6 @@ class GoogleStreamingSession:
                 await asyncio.wait_for(self._stream_task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._stream_task.cancel()
+            except Exception:
+                log.exception("stream task failed")
         return self._running_transcript

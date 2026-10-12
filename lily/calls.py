@@ -27,11 +27,16 @@ class CallSession:
     # mid-analysis, mark dirty and rerun once with the latest transcript.
     analysis_in_flight: bool = False
     analysis_dirty: bool = False
-    intervened: bool = False
+    intervened: bool = False  # urgent alert already sent
+    struck: bool = False      # scam strike already recorded for this call
 
     @property
     def full_transcript(self) -> str:
         return " ".join(self.transcript)
+
+
+class CallExistsError(ValueError):
+    """A session for this call_sid is already active."""
 
 
 class CallRegistry:
@@ -39,6 +44,8 @@ class CallRegistry:
         self._calls: dict[str, CallSession] = {}
 
     def create(self, call_sid: str, caller: str = "unknown") -> CallSession:
+        if call_sid in self._calls:
+            raise CallExistsError(call_sid)
         session = CallSession(call_sid=call_sid, caller=caller)
         self._calls[call_sid] = session
         return session

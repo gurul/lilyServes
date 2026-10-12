@@ -68,3 +68,15 @@ def test_twiml_pass_escapes_and_includes_params():
 def test_twiml_screen_has_gather_and_fallback():
     xml = screening.twiml_screen("https://x.example/screen/result")
     assert "<Gather" in xml and "Hangup" in xml
+
+
+def test_known_caller_with_one_strike_is_screened():
+    ctx = _ctx(known=True, call_count=3, scam_strikes=1)
+    assert screening.decide_route("+15551234567", ctx, [], True) == screening.ROUTE_SCREEN
+
+
+def test_anonymous_with_strikes_is_screened_not_blocked():
+    for caller in ("", "  ", "Anonymous", "unknown", None):
+        ctx = {"known": True, "scam_strikes": 5, "call_count": 9}
+        assert screening.decide_route(caller, ctx, [], True) == screening.ROUTE_SCREEN
+    assert screening.is_anonymous("") and screening.is_anonymous(None)
