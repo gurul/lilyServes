@@ -190,7 +190,7 @@ def _shingles(text: str, n: int = 3) -> set[tuple[str, ...]]:
     words = text.lower().split()
     if len(words) < n:
         return {tuple(words)} if words else set()
-    return set(zip(*(words[i:] for i in range(n))))
+    return set(zip(*(words[i:] for i in range(n)), strict=False))
 
 
 def _jaccard(a: set, b: set) -> float:

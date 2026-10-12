@@ -448,8 +448,9 @@ async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None
         payload["full_transcript"] = full_transcript
     await hub.broadcast(payload, INFO)
 
-    # Payment-stage markers and theta-2 fire immediately — scam-progression
-    # research shows 1-2 turns of lead time once payment language appears.
+    # A corroborated payment marker or the EWMA hard threshold alerts at once:
+    # a live call cannot wait for the payment request to complete
+    # (arXiv:2605.12243). Strikes still wait for an LLM "scam" verdict.
     if state.hard_alert or heur.level == "High":
         await _escalate_high_risk(session, "Signals: " + ", ".join(heur.signals))
 

@@ -62,7 +62,7 @@ class ClientHub:
             *(asyncio.wait_for(ws.send_text(text), SEND_TIMEOUT_SECONDS) for ws in clients),
             return_exceptions=True,
         )
-        dead = [ws for ws, r in zip(clients, results) if isinstance(r, BaseException)]
+        dead = [ws for ws, r in zip(clients, results, strict=True) if isinstance(r, BaseException)]
         if dead:
             async with self._lock:
                 for ws in dead:
