@@ -68,16 +68,46 @@ CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity(ts);
 CREATE INDEX IF NOT EXISTS idx_events_number ON events(number);
 """
 
-# Redaction: long digit runs (cards, SSN with/without dashes, codes), plus
+# Redaction: long digit runs (cards, SSN with/without separators, codes), plus
 # context-keyed short secrets ("my PIN is 1234") that the length-based rules
-# are too coarse to catch.
+# are too coarse to catch. Speech-to-text and SMS split codes into groups
+# ("482 913", "482-913") or single digits ("4 8 2 9 1 3"), so the digit
+# patterns accept short runs of space, dot, or dash between digits.
+_SEP = r"[ .\-]{0,2}"
 _RE_PIN = re.compile(
-    r"(?i)\b(pin|code|otp|cvv|passcode|password|one[- ]time)\b"
-    r"(\W{0,3}(?:is|was|:)?\W{0,3})(\d{3,8})\b"
+    r"(?i)\b((?:pin|code|otp|cvv|cvc|passcode|password|one[- ]time|verification)"
+    r"(?:\s+(?:number|no\.?|num|#))?)\b"
+    r"(\W{0,3}(?:is|was|:)?\W{0,3})(\d(?:" + _SEP + r"\d){2,11})\b"
 )
-_RE_CARD = re.compile(r"\b(?:\d[ -]?){13,19}\b")
-_RE_SSN = re.compile(r"\b\d{3}[- ]?\d{2}[- ]?\d{4}\b")
+# Card candidates: 13-19 digits, optionally separated. A candidate is only
+# redacted when it passes the Luhn check (or is one unbroken digit run), so
+# separated numbers that merely happen to be long are left alone.
+_RE_CARD = re.compile(r"\b\d(?:" + _SEP + r"\d){12,18}\b")
+_RE_SSN = re.compile(r"\b\d{3}[- .]?\d{2}[- .]?\d{4}\b")
+# Digit-by-digit dictation of a code: five or more single digits.
+_RE_SPOKEN_DIGITS = re.compile(r"(?<![\d.,:/$])\b\d(?: {1,2}\d){4,}\b(?![.,:/]\d)")
 _RE_CODE = re.compile(r"\b\d{5,8}\b")
+
+
+def _luhn_ok(digits: str) -> bool:
+    """Luhn mod-10 check digit, per ISO/IEC 7812-1 (payment card numbers)."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _redact_card(m: re.Match) -> str:
+    raw = m.group(0)
+    digits = re.sub(r"\D", "", raw)
+    if digits == raw or _luhn_ok(digits):
+        return "[redacted number]"
+    return raw
 
 
 def redact(text: str) -> str:
@@ -85,8 +115,9 @@ def redact(text: str) -> str:
     if not text:
         return text
     text = _RE_PIN.sub(lambda m: m.group(1) + m.group(2) + "[redacted code]", text)
-    text = _RE_CARD.sub("[redacted number]", text)
+    text = _RE_CARD.sub(_redact_card, text)
     text = _RE_SSN.sub("[redacted number]", text)
+    text = _RE_SPOKEN_DIGITS.sub("[redacted code]", text)
     text = _RE_CODE.sub("[redacted code]", text)
     return text
 

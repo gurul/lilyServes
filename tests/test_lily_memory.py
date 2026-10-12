@@ -365,11 +365,14 @@ def test_superseded_memory_hidden_but_auditable(svc):
 
 def test_duplicate_reinforces_instead_of_duplicating(svc):
     async def run():
+        # Dedupe is scoped to one real caller; withheld callers never merge.
         first = await svc.remember("Grandson called about lunch on Friday",
-                                   MemoryType.EPISODE, importance=0.5)
+                                   MemoryType.EPISODE, importance=0.5,
+                                   caller="+15551110000")
         await _drain(svc)()
         await svc.remember("Grandson called about lunch on Friday",
-                           MemoryType.EPISODE, importance=0.5)
+                           MemoryType.EPISODE, importance=0.5,
+                           caller="+15551110000")
         await _drain(svc)()
         assert await svc.count() == 1
         got = await svc.db.get(first.id)
@@ -383,9 +386,11 @@ def test_duplicate_reinforces_lexically_without_embeddings(tmp_path):
 
     async def run():
         await service.open()
-        await service.remember("Grandson called about lunch on Friday")
+        await service.remember("Grandson called about lunch on Friday",
+                               caller="+15551110000")
         await _drain(service)()
-        await service.remember("Grandson called about lunch on Friday")
+        await service.remember("Grandson called about lunch on Friday",
+                               caller="+15551110000")
         await _drain(service)()
         assert await service.count() == 1
         await service.close()

@@ -16,6 +16,7 @@ when embeddings are unavailable.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import re
 import time
@@ -24,9 +25,19 @@ from lily.memory.models import Memory, MemoryStatus, MemoryType
 
 log = logging.getLogger("lily.memory.lifecycle")
 
-# Twilio collapses every withheld caller ID onto shared constants; never treat
-# those as an identity worth superseding facts across.
-ANON_CALLERS = {"unknown", "anonymous"}
+# Twilio collapses every withheld caller ID onto shared constants, and the app
+# maps withheld callers to "". None of these is an identity: facts from one
+# withheld call must never merge into or supersede another caller's facts.
+ANON_CALLERS = frozenset({
+    "", "unknown", "anonymous", "restricted", "private", "unavailable",
+    "blocked", "withheld",
+})
+
+
+def is_withheld_caller(caller: str | None) -> bool:
+    """True when `caller` names no real identity (empty or a withheld-ID
+    placeholder). The single test every caller-identity guard uses."""
+    return (caller or "").strip().lower() in ANON_CALLERS
 
 DAY = 86400.0
 
@@ -54,7 +65,15 @@ _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
 _MONTHS = ("january", "february", "march", "april", "may", "june", "july",
            "august", "september", "october", "november", "december")
 
-_RE_TIME = re.compile(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
+# "at 4", "at 4:30 pm", "@ 4:00 PM", "at 4 p.m.", "at 4:00 P.M.".
+_RE_TIME = re.compile(
+    r"(?:\bat\s+|@\s*)(\d{1,2})(?::(\d{2}))?(?!\d)"
+    r"(?:\s*([ap])\.?\s?m\b\.?)?",
+    re.IGNORECASE,
+)
+# A bare hour 1-7 with no am/pm ("Friday at 4") is an afternoon appointment;
+# 8-12 stay as said (morning, noon).
+_BARE_PM_HOURS = range(1, 8)
 _RE_MONTH_DAY = re.compile(
     r"\b(" + "|".join(_MONTHS) + r")\s+(\d{1,2})\b", re.IGNORECASE
 )
@@ -62,80 +81,96 @@ _RE_NUMERIC_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})\b")
 
 
 def resolve_when(when_text: str, ref_ts: float | None = None) -> float | None:
-    """Resolve informal when-text ("Friday at 4 pm", "tomorrow", "March 5")
-    to epoch seconds, relative to ref_ts. None when nothing resolves."""
+    """Resolve informal when-text ("Friday at 4 pm", "tomorrow", "March 5",
+    "Friday next week") to epoch seconds, relative to ref_ts. None when
+    nothing resolves.
+
+    Day offsets are calendar-date arithmetic in local time, never
+    `+ n * 86400`: a DST transition makes one local day 23 or 25 hours long.
+    """
     if not when_text or not when_text.strip():
         return None
     now = time.localtime(ref_ts if ref_ts is not None else time.time())
     ref = time.mktime(now)
+    today = datetime.date(now.tm_year, now.tm_mon, now.tm_mday)
     text = when_text.lower()
+    next_week = "next week" in text
 
-    day_ts: float | None = None
+    day: datetime.date | None = None
     from_weekday = False
     if "today" in text or "tonight" in text:
-        day_ts = ref
+        day = today
     elif "tomorrow" in text:
-        day_ts = ref + DAY
-    elif "next week" in text:
-        day_ts = ref + 7 * DAY
+        day = today + datetime.timedelta(days=1)
     else:
         for i, name in enumerate(_WEEKDAYS):
             if name in text or f" {name[:3]} " in f" {text} ":
                 # 0 = today: "Friday at 4 pm" said Friday morning means today;
                 # the past-time check below rolls it forward when it's gone by.
-                ahead = (i - now.tm_wday) % 7
-                day_ts = ref + ahead * DAY
+                day = today + datetime.timedelta(days=(i - now.tm_wday) % 7)
                 from_weekday = True
                 break
-        if day_ts is None:
+        if day is not None and next_week:
+            # "Friday next week": the weekday, then one week on.
+            day += datetime.timedelta(days=7)
+            from_weekday = False
+        elif day is None and next_week:
+            day = today + datetime.timedelta(days=7)
+        if day is None:
             m = _RE_MONTH_DAY.search(text)
             if m:
-                month, day = _MONTHS.index(m.group(1).lower()) + 1, int(m.group(2))
-                day_ts = _next_date(now, month, day)
+                month, dom = _MONTHS.index(m.group(1).lower()) + 1, int(m.group(2))
+                day = _next_date(now, month, dom)
             else:
                 m = _RE_NUMERIC_DATE.search(text)
                 if m:
-                    month, day = int(m.group(1)), int(m.group(2))
-                    if 1 <= month <= 12 and 1 <= day <= 31:
-                        day_ts = _next_date(now, month, day)
+                    month, dom = int(m.group(1)), int(m.group(2))
+                    if 1 <= month <= 12 and 1 <= dom <= 31:
+                        day = _next_date(now, month, dom)
 
-    if day_ts is None:
+    if day is None:
         return None
 
     # Default to end of day; an explicit "at H[:MM] [am/pm]" refines it.
-    day = time.localtime(day_ts)
     hour, minute = 23, 59
     m = _RE_TIME.search(text)
     if m:
-        hour = int(m.group(1)) % 12 if m.group(3) else int(m.group(1))
-        if m.group(3) and m.group(3).lower() == "pm":
-            hour += 12
-        minute = int(m.group(2) or 0)
-    try:
-        ts = time.mktime((day.tm_year, day.tm_mon, day.tm_mday,
-                          hour, minute, 0, -1, -1, -1))
-    except (ValueError, OverflowError):
-        return None
-    if from_weekday and ts < ref - 300:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        meridiem = (m.group(3) or "").lower()
+        if meridiem:
+            h = h % 12 + (12 if meridiem == "p" else 0)
+            valid = 1 <= int(m.group(1)) <= 12
+        else:
+            if h in _BARE_PM_HOURS:
+                h += 12
+            valid = h <= 23
+        if valid and mi <= 59:
+            hour, minute = h, mi
+    ts = _local_ts(day, hour, minute)
+    if ts is not None and from_weekday and ts < ref - 300:
         # A same-day weekday mention whose time already passed means next week.
-        rolled = time.localtime(day_ts + 7 * DAY)
-        try:
-            ts = time.mktime((rolled.tm_year, rolled.tm_mon, rolled.tm_mday,
-                              hour, minute, 0, -1, -1, -1))
-        except (ValueError, OverflowError):
-            return None
+        ts = _local_ts(day + datetime.timedelta(days=7), hour, minute)
     return ts
 
 
-def _next_date(now: time.struct_time, month: int, day: int) -> float | None:
+def _local_ts(day: datetime.date, hour: int, minute: int) -> float | None:
+    """Epoch seconds for a local wall-clock time; mktime resolves DST."""
+    try:
+        return time.mktime((day.year, day.month, day.day, hour, minute, 0, -1, -1, -1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _next_date(now: time.struct_time, month: int, day: int) -> datetime.date | None:
     """The next occurrence of month/day, rolling to next year when passed."""
+    today = datetime.date(now.tm_year, now.tm_mon, now.tm_mday)
     for year in (now.tm_year, now.tm_year + 1):
         try:
-            ts = time.mktime((year, month, day, 0, 0, 0, -1, -1, -1))
-        except (ValueError, OverflowError):
-            return None
-        if ts >= time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, -1, -1, -1)):
-            return ts
+            candidate = datetime.date(year, month, day)
+        except ValueError:
+            continue  # e.g. Feb 29 in a non-leap year
+        if candidate >= today:
+            return candidate
     return None
 
 
@@ -212,16 +247,23 @@ async def maintain(service, memory: Memory, vector: list[float] | None) -> None:
     Runs after the embedding lands (or immediately, lexical-only, under
     NullEmbedder). `service` is the owning MemoryService.
     """
+    if is_withheld_caller(memory.caller):
+        # No identity to scope by: db.recent(caller="") would match every
+        # caller, letting a withheld caller's claim merge into or supersede
+        # another caller's facts. Withheld-caller memories are left as written.
+        return
     fresh = await service.db.get(memory.id)
     if fresh is None or fresh.status != MemoryStatus.ACTIVE:
         return  # deleted or already retired while the embedding was in flight
 
     # Only strictly older memories are merge/supersede targets: a consistent
     # direction means concurrent maintenance can never mutually annihilate a
-    # pair of duplicates.
+    # pair of duplicates. The exact caller match is enforced here as well as
+    # in the query, so a scope change in db.recent() cannot widen it.
     candidates = [
         m for m in await service.db.recent(40, memory.memory_type, memory.caller)
-        if (m.created_at, m.id) < (memory.created_at, memory.id)
+        if m.caller == memory.caller
+        and (m.created_at, m.id) < (memory.created_at, memory.id)
         and (memory.created_at - m.created_at) < 30 * DAY
     ]
     if not candidates:
@@ -249,7 +291,7 @@ async def maintain(service, memory: Memory, vector: list[float] | None) -> None:
                 continue
         if duplicate:
             # Atomic reinforce+delete; both rows re-checked inside the write.
-            if await service.db.merge_into(old.id, memory, time.time()):
+            if await service.db.merge_into(old.id, memory, time.time(), vector):
                 if is_commitment:
                     await _fire(service.on_commitment_merged, memory.id, old.id)
                 return  # the new row merged into the old — nothing left to do
@@ -257,8 +299,6 @@ async def maintain(service, memory: Memory, vector: list[float] | None) -> None:
 
         if memory.memory_type not in SUPERSEDABLE:
             continue
-        if memory.caller.lower() in ANON_CALLERS:
-            continue  # shared anonymous bucket is not an identity
         same_subject_band = (
             SUPERSEDE_COSINE <= cos < DUP_COSINE
             or SUPERSEDE_JACCARD <= sh_jac < DUP_JACCARD
