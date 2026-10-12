@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 
@@ -19,6 +20,7 @@ import numpy as np
 
 from lily.memory.embeddings import pack_vector
 from lily.memory.models import Memory
+from lily.memory.operational import redact
 
 log = logging.getLogger("lily.memory.store")
 
@@ -26,6 +28,12 @@ log = logging.getLogger("lily.memory.store")
 # Absolute (not min-max) so a single strong hit scores high and scores are
 # comparable across queries.
 BM25_K = 2.0
+
+# FTS5 'secure-delete' first shipped in SQLite 3.42.0; older builds reject it.
+# https://www.sqlite.org/fts5.html (6.13): "if the 'secure-delete' option is
+# set to 1, then full-text entries are actually removed from the database
+# when existing FTS5 table rows are updated or deleted."
+FTS5_SECURE_DELETE_MIN = (3, 42, 0)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -105,6 +113,10 @@ class MemoryDB:
         conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # forget() must not leave plaintext in freed pages.
+        # https://www.sqlite.org/pragma.html#pragma_secure_delete: "When
+        # secure_delete is on, SQLite overwrites deleted content with zeros."
+        conn.execute("PRAGMA secure_delete=ON")
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         cols = {r[1] for r in conn.execute("PRAGMA table_info(memories)")}
@@ -132,6 +144,7 @@ class MemoryDB:
         try:
             conn.executescript(_FTS_SCHEMA)
             self.fts_enabled = True
+            self._enable_fts_secure_delete(conn)
             missing = conn.execute(
                 "SELECT (SELECT count(*) FROM memories) - (SELECT count(*) FROM memories_fts)"
             ).fetchone()[0]
@@ -148,6 +161,51 @@ class MemoryDB:
                 conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             conn.commit()
         return conn
+
+    @staticmethod
+    def _enable_fts_secure_delete(conn: sqlite3.Connection) -> None:
+        """Make FTS5 drop index entries on delete instead of leaving
+        delete-keys that keep the old tokens readable until a merge. The
+        option is persistent; it needs SQLite >= 3.42.0, and once used, older
+        FTS5 builds cannot read the table without a 'rebuild'."""
+        if sqlite3.sqlite_version_info < FTS5_SECURE_DELETE_MIN:
+            log.warning(
+                "SQLite %s < 3.42.0: FTS5 secure-delete unavailable; forgotten "
+                "tokens may persist in the FTS index until a merge",
+                sqlite3.sqlite_version,
+            )
+            return
+        try:
+            conn.execute(
+                "INSERT INTO memories_fts(memories_fts, rank) VALUES ('secure-delete', 1)"
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            log.warning("FTS5 secure-delete not enabled (%s)", e)
+
+    def _index_put_locked(self, memory_id: str, caller: str, memory_type: str,
+                          vec: np.ndarray) -> None:
+        """Insert or replace a unit vector in the in-process index. Caller
+        holds _lock."""
+        if self._vectors is not None and vec.shape[0] != self._vectors.shape[1]:
+            log.warning(
+                "embedding dim %d != index dim %d — stored to DB only",
+                vec.shape[0], self._vectors.shape[1],
+            )
+            return
+        if memory_id in self._vec_ids:
+            # Copy-on-write keeps vector_search's matrix snapshot immutable.
+            replaced = self._vectors.copy()
+            replaced[self._vec_ids.index(memory_id)] = vec
+            self._vectors = replaced
+            return
+        self._vec_ids.append(memory_id)
+        self._vec_callers.append(caller or "")
+        self._vec_types.append(memory_type)
+        if self._vectors is None:
+            self._vectors = vec.reshape(1, -1)
+        else:
+            self._vectors = np.vstack([self._vectors, vec])
 
     def _load_vectors(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
@@ -255,28 +313,8 @@ class MemoryDB:
                 return  # memory deleted before the embedding landed, or degenerate
             if row["status"] != "active":
                 return  # retired mid-flight: blob kept, but no ghost index row
-            vec = vec / norm
-            if self._vectors is not None and vec.shape[0] != self._vectors.shape[1]:
-                log.warning(
-                    "embedding dim %d != index dim %d — stored to DB only",
-                    vec.shape[0], self._vectors.shape[1],
-                )
-                return
-            if memory_id in self._vec_ids:
-                # Copy-on-write keeps vector_search's matrix snapshot immutable.
-                replaced = self._vectors.copy()
-                replaced[self._vec_ids.index(memory_id)] = vec
-                self._vectors = replaced
-            elif self._vectors is None:
-                self._vec_ids.append(memory_id)
-                self._vec_callers.append(row["caller"] or "")
-                self._vec_types.append(row["memory_type"])
-                self._vectors = vec.reshape(1, -1)
-            else:
-                self._vec_ids.append(memory_id)
-                self._vec_callers.append(row["caller"] or "")
-                self._vec_types.append(row["memory_type"])
-                self._vectors = np.vstack([self._vectors, vec])
+            self._index_put_locked(memory_id, row["caller"], row["memory_type"],
+                                   vec / norm)
 
     def _evict_vector_locked(self, memory_id: str) -> None:
         """Remove a memory's row from the in-process index. Caller holds _lock."""
@@ -373,13 +411,15 @@ class MemoryDB:
 
         return await self._run(q)
 
-    async def missing_embedding_ids(self, limit: int = 50) -> list[str]:
-        """Rows written while the embedder was down — candidates for healing."""
+    async def missing_embedding_ids(self, limit: int = 50, after: str = "") -> list[str]:
+        """Rows written while the embedder was down — candidates for healing.
+        Ordered by id; pass the last id seen as `after` to page through."""
         def q(conn: sqlite3.Connection):
             return [
                 r["id"] for r in conn.execute(
                     "SELECT id FROM memories WHERE embedding IS NULL "
-                    "AND status = 'active' LIMIT ?", (limit,)
+                    "AND status = 'active' AND id > ? ORDER BY id LIMIT ?",
+                    (after, limit),
                 ).fetchall()
             ]
 
@@ -388,10 +428,15 @@ class MemoryDB:
     # ----- lexical search ----------------------------------------------------
 
     @staticmethod
-    def _fts_quote(query: str) -> str:
+    def _terms(query: str) -> list[str]:
+        """Word tokens of a query, lower-cased. Punctuation is dropped so
+        "pharmacy?" matches like "pharmacy" in both FTS and coverage."""
+        return [t.lower() for t in re.findall(r"\w+", query)]
+
+    @classmethod
+    def _fts_quote(cls, query: str) -> str:
         """Quote each term so user text can't hit FTS5 query syntax."""
-        terms = [t.replace('"', "") for t in query.split()]
-        return " OR ".join(f'"{t}"' for t in terms if t)
+        return " OR ".join(f'"{t}"' for t in cls._terms(query))
 
     @staticmethod
     def _scope_clause(caller: str, memory_types: list[str] | None) -> tuple[str, list]:
@@ -446,7 +491,7 @@ class MemoryDB:
             # term coverage is the anchor (BM25's IDF collapses to ~0 on small
             # corpora where every doc matches), saturated bm25 adds
             # discrimination between matches at scale.
-            terms = [t.replace('"', "").lower() for t in query.split() if t]
+            terms = self._terms(query)
             out = []
             for row in rows:
                 raw = max(0.0, -row["rank"])
@@ -460,7 +505,7 @@ class MemoryDB:
             return out
 
         # LIKE fallback: fraction of query terms present.
-        terms = [t.lower() for t in query.split() if t]
+        terms = self._terms(query)
         if not terms:
             return []
 
@@ -576,33 +621,47 @@ class MemoryDB:
                     out[mid] = float(self._vectors[self._vec_ids.index(mid)] @ vec)
             return out
 
-    async def merge_into(self, old_id: str, memory, now: float) -> bool:
+    async def merge_into(self, old_id: str, memory, now: float,
+                         vector: list[float] | None = None) -> bool:
         """Atomically absorb the (newer) `memory` row into `old_id`: reinforce
         the old row and delete the new one in a single commit. Both rows are
         re-checked inside the critical section, so a concurrent forget() can
         never have its content resurrected by a half-done merge.
+        When the survivor adopts the newer content, `vector` (the newer
+        content's embedding) becomes the survivor's embedding; without one,
+        the embedding is NULLed and the open() healer re-embeds it.
         Returns False (no writes) when either row is gone or retired."""
+        unit = None
+        if vector is not None:
+            arr = np.asarray(vector, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            if norm > 0 and np.isfinite(norm):
+                unit = arr / norm
+        blob = pack_vector(vector) if unit is not None else None
+
         def w(conn: sqlite3.Connection):
             old = conn.execute(
-                "SELECT content, importance, confidence, entities, topics "
-                "FROM memories WHERE id = ? AND status = 'active'", (old_id,)
+                "SELECT content, importance, confidence, entities, topics, caller, "
+                "memory_type FROM memories WHERE id = ? AND status = 'active'", (old_id,)
             ).fetchone()
             new = conn.execute(
                 "SELECT 1 FROM memories WHERE id = ? AND status = 'active'", (memory.id,)
             ).fetchone()
             if old is None or new is None:
-                return False, False
+                return False, False, None
             adopt = len(memory.content) > len(old["content"])
-            merged_entities = list(dict.fromkeys(
-                json.loads(old["entities"] or "[]") + memory.entities))
-            merged_topics = list(dict.fromkeys(
-                json.loads(old["topics"] or "[]") + memory.topics))
+            # Redact the union: rows written before entity/topic redaction
+            # existed are scrubbed the first time they are merged.
+            merged_entities = list(dict.fromkeys(redact(e) for e in (
+                json.loads(old["entities"] or "[]") + memory.entities)))
+            merged_topics = list(dict.fromkeys(redact(t) for t in (
+                json.loads(old["topics"] or "[]") + memory.topics)))
             conn.execute(
                 "UPDATE memories SET content = ?, importance = ?, confidence = ?, "
                 "entities = ?, topics = ?, source_count = source_count + 1, "
-                # Adopted content invalidates the old embedding; NULL lets the
-                # missing-embedding healer re-embed the new text.
-                "updated_at = ?, embedding = CASE WHEN ? THEN NULL ELSE embedding END "
+                # Adopted content invalidates the old embedding: take the new
+                # text's vector, or NULL so the open() healer re-embeds it.
+                "updated_at = ?, embedding = CASE WHEN ? THEN ? ELSE embedding END "
                 "WHERE id = ?",
                 (
                     memory.content if adopt else old["content"],
@@ -612,19 +671,23 @@ class MemoryDB:
                     json.dumps(merged_topics),
                     now,
                     1 if adopt else 0,
+                    blob,
                     old_id,
                 ),
             )
             conn.execute("DELETE FROM memories WHERE id = ?", (memory.id,))
             conn.commit()
-            return True, adopt
+            return True, adopt, (old["caller"], old["memory_type"])
 
         async with self._lock:
-            merged, adopted = await asyncio.to_thread(w, self._conn_or_raise())
+            merged, adopted, owner = await asyncio.to_thread(w, self._conn_or_raise())
             if merged:
                 self._evict_vector_locked(memory.id)
                 if adopted:
-                    self._evict_vector_locked(old_id)
+                    if unit is not None:
+                        self._index_put_locked(old_id, owner[0], owner[1], unit)
+                    else:
+                        self._evict_vector_locked(old_id)
         return merged
 
     async def expire_due(self, now: float) -> list[str]:

@@ -63,6 +63,11 @@ REL_FLOOR = 0.15
 # dashboard shows genuinely related context, not the least-bad match.
 MIN_SCORE = 0.35
 
+# open() heals rows that have no embedding in pages of HEAL_BATCH, and stops
+# after HEAL_MAX rows so one restart cannot queue unbounded embedding work.
+HEAL_BATCH = 50
+HEAL_MAX = 10_000
+
 
 class MemoryService:
     def __init__(self, data_dir: str, embedder=None) -> None:
@@ -95,12 +100,30 @@ class MemoryService:
     async def open(self) -> None:
         await self.db.open()
         await self._sweep(time.time())
-        # Heal rows written while the embedder was down.
-        missing = await self.db.missing_embedding_ids()
-        if missing:
-            memories = await self.db.get_many(missing)
-            for memory in memories.values():
-                self._track(self._embed_and_store(memory))
+        # Heal rows written while the embedder was down (or whose embedding a
+        # merge invalidated) — every one of them, not just the first page.
+        self._track(self._heal_missing_embeddings())
+
+    async def _heal_missing_embeddings(self) -> None:
+        """Re-embed every active row without an embedding, page by page.
+
+        A keyset cursor (id > after) walks the table, so rows that stay
+        unembedded (embedder still down) cannot make the loop spin. Bounded by
+        HEAL_MAX rows per open()."""
+        after, healed = "", 0
+        while healed < HEAL_MAX and not self._closing:
+            ids = await self.db.missing_embedding_ids(HEAL_BATCH, after=after)
+            if not ids:
+                return
+            after = ids[-1]
+            healed += len(ids)
+            memories = await self.db.get_many(ids)
+            await asyncio.gather(
+                *(self._embed_and_store(memories[i]) for i in ids if i in memories),
+                return_exceptions=True,
+            )
+        if healed >= HEAL_MAX:
+            log.warning("embedding heal stopped at %d rows; rest heal next open", HEAL_MAX)
 
     async def _sweep(self, now: float) -> None:
         """Expire past-due memories and purge long-retired rows."""
@@ -134,8 +157,10 @@ class MemoryService:
         memory = Memory(
             content=redact(content.strip()),
             memory_type=memory_type if memory_type in MemoryType.ALL else MemoryType.EPISODE,
-            entities=[e for e in (entities or []) if e],
-            topics=[t for t in (topics or []) if t],
+            # Entities and topics are stored and FTS-indexed like content, so
+            # they get the same redaction.
+            entities=[redact(e) for e in (entities or []) if e],
+            topics=[redact(t) for t in (topics or []) if t],
             importance=max(0.0, min(1.0, importance)),
             confidence=max(0.0, min(1.0, confidence)),
             caller=caller,
@@ -163,8 +188,15 @@ class MemoryService:
             log.exception("lifecycle maintenance failed for %s", memory.id[:8])
 
     async def forget(self, memory_id: str) -> bool:
-        """Delete a memory — "You own your data. Always." """
-        return await self.db.delete(memory_id)
+        """Delete a memory — "You own your data. Always."
+
+        A forgotten COMMITMENT must not live on as its operational event
+        twin, so the retired hook fires and closes the linked event. Closing
+        events linked to a deleted id is safe for any memory type."""
+        deleted = await self.db.delete(memory_id)
+        if deleted:
+            await lifecycle._fire(self.on_commitment_retired, memory_id)
+        return deleted
 
     # ----- read path ---------------------------------------------------------
 
