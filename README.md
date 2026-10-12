@@ -84,6 +84,8 @@ pytest          # 280+ tests: heuristics, fusion, screening, memory, lifecycle, 
 ruff check .
 ```
 
+The risk-fusion safety invariants (a deepfake never lowers risk, the EWMA stays in [0, 1], an LLM scam verdict always alerts, a lone payment word with a safe verdict does not, the displayed level never decreases) are proved in Lean 4 over an exact model of `fusion.py`. Check them with `cd proofs && lake build` (Lean 4.34.1, no Mathlib). What the model covers, and where it differs from the Python: [proofs/README.md](proofs/README.md).
+
 ## Configuration
 
 All configuration is environment variables (see `.env.example` for the full annotated list). Credentials belong in `.env`, which is gitignored — never commit keys.
