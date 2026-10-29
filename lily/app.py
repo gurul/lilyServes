@@ -555,12 +555,25 @@ async def _capture_commitment(call_sid: str, caller: str, title: str, when: str)
     return await store.add_event(call_sid, caller, title, when, memory_id=mem.id)
 
 
+def _is_scam_call(level: str) -> bool:
+    """A scammer's instructions read like commitments ("buy the cards Friday
+    at 3"). A High-risk call writes no reminders or facts."""
+    return level == "High"
+
+
 async def _capture_events(call_sid: str, sentence: str) -> None:
     """Active Assistance: turn a spoken commitment into a stored reminder."""
     session = registry.get(call_sid)
-    caller = session.caller if session else "unknown"
-    for event in await extract_events(sentence):
-        event_id = await _capture_commitment(call_sid, caller, event["title"], event["when"])
+    if session is None or _is_scam_call(session.scam_level):
+        return
+    events = await extract_events(sentence)
+    # Check again: the call can escalate, or end, while the model works. An
+    # ended call's commitments come from the summary sweep in _finalize_call.
+    session = registry.get(call_sid)
+    if session is None or _is_scam_call(session.scam_level):
+        return
+    for event in events:
+        event_id = await _capture_commitment(call_sid, session.caller, event["title"], event["when"])
         title = event["title"] + (f" — {event['when']}" if event["when"] else "")
         await push_activity(
             "event_captured", "Event captured", title, NOTABLE, call_sid, store,
@@ -669,24 +682,35 @@ async def _finalize_call(call_sid: str) -> None:
         call_sid, session.caller, final_level,
         session.deepfake_score, summary, session.transcript,
     ))
+    # The call's own record is kept either way: a scam call becomes SAFETY.
     _spawn(memory.remember_call(
         call_sid, session.caller, str(summary.get("summary", "")), final_level,
     ))
-    # Summary-extracted commitments join the same linked write path as
-    # mid-call captures; skip ones already captured during the call.
-    seen_titles = {
-        e["title"].lower() for e in await store.events_for_call(call_sid)
-    }
-    for event in summary.get("events", []):
-        if isinstance(event, dict) and event.get("title"):
-            title = str(event["title"])
-            # Stored titles are redacted — compare like with like.
-            if redact(title).lower() in seen_titles:
-                continue
-            _spawn(_capture_commitment(
-                call_sid, session.caller, title, str(event.get("when", ""))
-            ))
-    _capture_facts(call_sid, session.caller, summary.get("facts", []))
+    retired: list[int] = []
+    if _is_scam_call(final_level):
+        # Reminders captured before the call turned High were the scammer's
+        # instructions too: close them and their commitment memories.
+        for event in await store.events_for_call(call_sid):
+            memory_id = await store.complete_event(event["id"])
+            if memory_id:
+                _spawn(memory.complete_commitment(memory_id))
+            retired.append(event["id"])
+    else:
+        # Summary-extracted commitments join the same linked write path as
+        # mid-call captures; skip ones already captured during the call.
+        seen_titles = {
+            e["title"].lower() for e in await store.events_for_call(call_sid)
+        }
+        for event in summary.get("events", []):
+            if isinstance(event, dict) and event.get("title"):
+                title = str(event["title"])
+                # Stored titles are redacted — compare like with like.
+                if redact(title).lower() in seen_titles:
+                    continue
+                _spawn(_capture_commitment(
+                    call_sid, session.caller, title, str(event.get("when", ""))
+                ))
+        _capture_facts(call_sid, session.caller, summary.get("facts", []))
 
     await hub.broadcast({
         "event": "call_summary",
@@ -695,6 +719,7 @@ async def _finalize_call(call_sid: str) -> None:
         "summary": summary,
         "scam_level": final_level,
         "deepfake_score": session.deepfake_score,
+        "retired_events": retired,
     }, IMPORTANT if final_level != "Low" else NOTABLE)
     await push_activity(
         "call_ended",

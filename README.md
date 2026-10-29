@@ -1,5 +1,7 @@
 # lilyServes
 
+[![CI](https://github.com/gurul/lilyServes/actions/workflows/ci.yml/badge.svg)](https://github.com/gurul/lilyServes/actions/workflows/ci.yml)
+
 <p align="center">
   <a href="https://heylily.vercel.app"><img src="assets/heylily-hero.png" alt="heyLily — the quiet way to stay independent. A gentle phone companion for older adults and people living with memory loss, screening a restricted number with the option to let Lily answer first" width="100%"></a>
 </p>
@@ -17,12 +19,13 @@ A scam call only works while it is happening. By the time a transcript is review
 ## Features
 
 - **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. A caller with two scam strikes is blocked outright; a strike comes only from a declined screen or an LLM *scam* verdict, and withheld caller IDs never accrue strikes (one anonymous scammer must not block every withheld caller). Every screen shows up on the dashboard as a *Stayed safe* event.
-- **Live scam detection, research-grounded.** A sub-millisecond heuristic engine scores every sentence instantly. Its rules cover gift cards, wire transfers, crypto, urgency, secrecy, grandparent-scam patterns, remote-access and verification-code requests, and the elder-fraud scripts that the FTC and FBI IC3 describe: Social Security benefit threats, jury-duty and arrest-warrant threats, couriers that pick up cash or gold, "protect your money" transfers, payment apps to "yourself", unauthorized-charge alerts, utility shutoff threats, refund and tech-support remote access, and guaranteed investment returns. A criteria-rubric LLM tier gives a scam / uncertain / safe verdict asynchronously, and malformed model output reads as uncertain, never safe. Signals fuse through a fixed-window EWMA with two thresholds. A payment-stage word alone gives Medium and an immediate LLM check; it escalates to a hard alert only when another signal, the LLM, or the EWMA corroborates it. The displayed risk level only escalates during a call (citations below).
+- **Live scam detection, research-grounded.** A sub-millisecond heuristic engine scores every sentence instantly. Its rules cover gift cards, wire transfers, crypto, urgency, secrecy, grandparent-scam patterns, remote-access and verification-code requests, requests to read back the numbers on a gift card or bank card, and the elder-fraud scripts that the FTC and FBI IC3 describe: Social Security benefit threats, jury-duty and arrest-warrant threats, couriers that pick up cash or gold, "protect your money" transfers, payment apps to "yourself", unauthorized-charge alerts, utility shutoff threats, refund and tech-support remote access, and guaranteed investment returns. A criteria-rubric LLM tier gives a scam / uncertain / safe verdict asynchronously, and malformed model output reads as uncertain, never safe. Signals fuse through a fixed-window EWMA with two thresholds. A payment-stage word alone gives Medium and an immediate LLM check; it escalates to a hard alert only when another signal, the LLM, or the EWMA corroborates it. The displayed risk level only escalates during a call (citations below).
 - **Deepfake detection.** The first ~10 seconds of caller audio go to Hive AI. A synthetic voice multiplies the transcript risk and alerts the family — urgently when the conversation is also suspicious — and can never *lower* a score.
 - **Cognitive continuity — lilyMemory.** A purpose-built long-term memory engine. Every call, commitment, trusted contact, extracted fact, and scam encounter becomes a typed memory (`episode` / `commitment` / `person` / `preference` / `win` / `safety`) with importance, confidence, entities, and topics. Recall is hybrid — semantic (embeddings + cosine) fused with lexical (entity-weighted FTS5 BM25), gated on relevance, shaded by type-aware recency, and MMR-diversified so near-duplicates never crowd the results. Alongside it, a structured SQLite store tracks caller history, trust, and scam strikes.
 - **A memory lifecycle that keeps memory honest.** Repeated observations *reinforce* the existing memory instead of duplicating it; a changed fact ("pickup moved to Saturday") *supersedes* the old one, which stays auditable but stops surfacing; commitments resolve their "Friday at 4 PM" into a real due date and *expire* after it passes (completing the reminder retires the memory too); low-importance chatter fades out while scam history never expires. All deterministic — no extra LLM calls — and `forget()` is always a hard delete.
 - **Caller profile card.** When the phone rings the dashboard instantly receives a structured card — stable facts, open commitments (soonest due first), recent moments, and the caller's scam record — assembled in one SQL query, no model round-trip, plus a compact rendering ready for prompt injection. Post-call, durable facts (who people are, how the user likes things done, wins worth celebrating) are extracted by the *same* LLM call that writes the summary.
 - **Event capture (Active Assistance).** "Main St. Pharmacy confirmed pickup for Friday @ 4:00 PM" becomes a structured reminder, extracted mid-call and pushed to the dashboard as an *Event captured* item. Post-call summaries also sweep for missed commitments.
+- **A scam call writes no reminders or memories.** A scammer's instructions sound like commitments ("buy the cards at Walgreens Friday at 3"), and "you've won a prize" sounds like good news. When a call reaches High risk, live or in the post-call summary, Lily stores no reminders, no extracted facts, and no good-news items from it. Reminders captured before the call turned High are closed, and `call_summary` lists their ids in `retired_events`. The call itself is kept as a `safety` memory.
 - **Family dashboard, smart updates.** Any number of clients connect over WebSocket and get a full snapshot plus live events. Every item carries an importance level (`info` / `notable` / `important` / `urgent`); only `important+` is flagged `notify: true` — peace of mind, not surveillance.
 - **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored — including every memory — passes through redaction that scrubs card numbers, SSNs, and one-time codes, and any memory can be deleted via the API (`DELETE /api/memories/{id}`). You own your data, always. `MEMORY_EMBEDDINGS=false` keeps memory fully offline (lexical recall only).
 - **Optional intervention.** With `AUTO_INTERVENE=true`, a call the LLM judges a scam is redirected to a polite hangup via the Twilio REST API. Off by default — warn, don't act.
@@ -62,7 +65,7 @@ flowchart LR
 
 ## Quick start
 
-Requires Python 3.10+ (3.13 supported — mulaw decode has a pure-Python fallback), a Twilio number, a Google Cloud project with Speech-to-Text enabled, an OpenAI key, and [ngrok](https://ngrok.com) for local development.
+Requires Python 3.10+ (3.13 supported — mulaw decode has a pure-Python fallback), a Twilio number, a Google Cloud project with Speech-to-Text enabled, an OpenAI key or a key for any OpenAI-compatible endpoint such as [OpenRouter](https://openrouter.ai) (set `OPENAI_BASE_URL`), and [ngrok](https://ngrok.com) for local development.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -80,11 +83,15 @@ On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — i
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 280+ tests: heuristics, fusion, screening, memory, lifecycle, pipeline, audio, auth
+pytest          # 319 tests: heuristics, fusion, screening, memory, lifecycle, pipeline, audio, auth
 ruff check .
 ```
 
-The risk-fusion safety invariants (a deepfake never lowers risk, the EWMA stays in [0, 1], an LLM scam verdict always alerts, a lone payment word with a safe verdict does not, the displayed level never decreases) are proved in Lean 4 over an exact model of `fusion.py`. Check them with `cd proofs && lake build` (Lean 4.34.1, no Mathlib). What the model covers, and where it differs from the Python: [proofs/README.md](proofs/README.md).
+CI runs both on Python 3.10, 3.12 and 3.13 for every push to `main` and every pull request. The tests need no network.
+
+The risk-fusion safety invariants (a deepfake never lowers risk, the EWMA stays in [0, 1], an LLM scam verdict always alerts, a lone payment word with a safe verdict does not, the displayed level never decreases) are checked over 3,000 seeded random call histories in `tests/test_fusion_properties.py`.
+
+To measure the LLM tier against a live model, run `python scripts/eval_llm_tier.py --runs 3`. It sends labelled scam and benign transcripts through the real `analyze_scam` call, including scam scripts the regex tier misses and scripts where the caller speaks instructions to an AI screener. It passes when every scam run returns `scam` and no benign run does. It calls a paid API: 17 cases × `--runs` requests.
 
 ## Configuration
 
@@ -92,7 +99,8 @@ All configuration is environment variables (see `.env.example` for the full anno
 
 | Variable | Required | Purpose |
 |---|---:|---|
-| `OPENAI_API_KEY` | Yes | Scam scoring, event extraction, summaries |
+| `OPENAI_API_KEY` | Yes | Scam scoring, event extraction, summaries, memory embeddings |
+| `OPENAI_BASE_URL` | No | Any OpenAI-compatible endpoint, e.g. `https://openrouter.ai/api/v1` with an OpenRouter key in `OPENAI_API_KEY`; OpenRouter accepts the default model names. Unset = OpenAI |
 | `PROJECT_ID` | Yes | Google Cloud project for Speech-to-Text V2 |
 | `FORWARD_TO` | Yes | Number calls are bridged to |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | Recommended | Webhook auto-config **and webhook signature validation** — without the token, webhooks are unauthenticated (dev only) |
@@ -136,7 +144,7 @@ Events pushed on `/ws/client` (all carry `importance` and `notify`):
 | `deepfake_result` | Once, ~10 s in |
 | `event_captured` | A commitment was extracted mid-call |
 | `activity` | Feed items: *Stayed safe*, *Event captured*, screening, alerts |
-| `call_summary` | On hangup: structured summary, indicators, recommended action |
+| `call_summary` | On hangup: structured summary, indicators, recommended action; `retired_events` lists reminders closed because the call was High risk |
 
 ## Project layout
 
@@ -154,7 +162,7 @@ lily/
 ├── transcription.py       STT V2 stream, bounded queue, reconnect-before-timeout
 ├── audio.py               mulaw → WAV, pure-Python fallback for 3.13+
 ├── detection/
-│   ├── heuristics.py      instant regex risk engine (16 weighted patterns)
+│   ├── heuristics.py      instant regex risk engine (26 weighted patterns)
 │   ├── detector.py        criteria-rubric LLM tier, 3-way verdict
 │   ├── fusion.py          EWMA multi-signal risk fusion, kill-chain stages
 │   └── deepfake.py        Hive AI check over a warm pooled connection
@@ -165,7 +173,9 @@ lily/
     ├── service.py         hybrid recall facade (calibrated fusion, MMR, profile card)
     ├── lifecycle.py       dedupe-reinforce, supersession, expiry, when-text resolver
     └── operational.py     callers/calls/events/activity store; PII redaction
-tests/                     280+ tests (no network required)
+tests/                     319 tests (no network required)
+scripts/eval_llm_tier.py   live LLM-tier eval (needs an API key)
+.github/workflows/ci.yml   ruff + pytest on Python 3.10, 3.12, 3.13
 ```
 
 ## Research grounding
@@ -174,12 +184,12 @@ Each line states what the cited source reports, then what we built on it. Items 
 
 - **Criteria-rubric prompting.** [arXiv:2506.06180](https://arxiv.org/abs/2506.06180) puts 11 voice-phishing evaluation criteria in the prompt and fine-tunes Llama3-8B. On its adversarial test set (non-scam transcripts that use scam vocabulary), GPT-4o with criteria scored 90.18–99.11% accuracy, the criteria-prompted fine-tuned Llama3-8B 87.50–94.64%, and a KoBERT classifier 56.25% (98.52% on the normal set). Our LLM prompt adapts those criteria.
 - **Three-way verdict (scam / uncertain / safe)** is our design choice. [arXiv:2502.03964](https://arxiv.org/abs/2502.03964) studies LLM-based real-time phone-scam detection, refines its method for precision, and explores the trade-off between recall and timeliness.
-- **The regex tier is easy to evade.** [arXiv:2507.16291](https://arxiv.org/abs/2507.16291) reports that LLM rewrites of real vishing scripts, which keep the meaning, cut ML classifier accuracy by up to 30.96%. So the LLM tier decides negatives.
+- **The regex tier is easy to evade.** [arXiv:2507.16291](https://arxiv.org/abs/2507.16291) reports that LLM rewrites of real vishing scripts, which keep the meaning, cut ML classifier accuracy by up to 30.96%. So the LLM tier decides negatives. `scripts/eval_llm_tier.py` shows the same gap on our rules. On 2026-10-28, two paraphrased scripts (a fake bank security team and a grandparent scam) scored Low on the regex tier before the card-number rule, and `gpt-4o-mini` called both a scam in every run, also when the caller added a sentence telling an AI screener to mark the call safe. The eval passed all 17 cases (14 scam, 3 benign) at 3 runs each.
 - **EWMA risk accumulation.** [arXiv:2509.05362](https://arxiv.org/abs/2509.05362) defines e₁ = S(m₁), eₜ = φ·S(mₜ) + (1−φ)·eₜ₋₁ with φ = 2/(T+1), and alerts at one threshold θ₁ = 0.7 (its θ₂ governs the scam-baiting agent, not alerting). We fix T at a 5-sentence window (φ = 1/3) because a live call has no final T, and we use two thresholds, 0.35 (Medium) and 0.60 (hard alert): *our design choices*.
 - **Payment-stage markers.** [arXiv:2605.12243](https://arxiv.org/abs/2605.12243) (PreScam) defines a scam kill chain and argues that a live system cannot always wait for the Termination phase, where the scammer asks for payment, before it flags a conversation. A lone payment word gives Medium plus an immediate LLM check, and a corroborated one gives a hard alert: *our design choice*.
 - **Deepfake score as a risk multiplier, not a standalone alarm** is our design choice. [arXiv:2411.00121](https://arxiv.org/abs/2411.00121) finds that state-of-the-art audio-deepfake detectors often rely on high-frequency features that natural corruptions or an attacker can easily manipulate.
 - **PII sanitization before any cloud LLM call.** [arXiv:2510.18493](https://arxiv.org/abs/2510.18493) (MASK) proposes sanitizing call transcripts because they often contain sensitive personal information that third-party providers may see during processing.
-- **Heuristic rule families** cite their source in `lily/detection/heuristics.py`: FTC consumer alerts on Social Security, jury-duty, utility, payment-app, tech-support, investment, and "move your money to protect it" scams, the FBI IC3 courier PSA ([PSA240129](https://www.ic3.gov/PSA/2024/PSA240129)), and the [FBI IC3 2024 Internet Crime Report](https://www.ic3.gov/AnnualReport/Reports/2024_IC3Report.pdf), which lists Tech Support ($982,440,006) and Government Impersonation ($208,096,366) losses for complainants over 60. Rule weights are our design choice.
+- **Heuristic rule families** cite their source in `lily/detection/heuristics.py`: the FTC gift-card page ("Only scammers will tell you to buy a gift card … and give them the numbers off the back of the card"), FTC consumer alerts on Social Security, jury-duty, utility, payment-app, tech-support, investment, and "move your money to protect it" scams, the FBI IC3 courier PSA ([PSA240129](https://www.ic3.gov/PSA/2024/PSA240129)), and the [FBI IC3 2024 Internet Crime Report](https://www.ic3.gov/AnnualReport/Reports/2024_IC3Report.pdf), which lists Tech Support ($982,440,006) and Government Impersonation ($208,096,366) losses for complainants over 60. Rule weights are our design choice.
 
 ## Security & privacy posture
 
@@ -194,8 +204,9 @@ Each line states what the cited source reports, then what we built on it. Items 
 - Call state is in-memory and single-process (SQLite memory survives restarts; in-flight calls do not).
 - Only the caller's inbound track is transcribed; the recipient's replies are not analyzed.
 - Screening uses heuristics only on the spoken answer — a calm, novel scam opening will get bridged (and then caught by live scoring).
+- The scam-call memory rule acts at High risk only. A Medium call, such as a family member mentioning a gift card, still captures its reminders and facts.
 - The dashboard is a protocol, not a UI — the heyLily frontend consumes it.
 
 ## Built with
 
-FastAPI, Twilio Voice + Media Streams, Google Cloud Speech-to-Text V2, OpenAI, Hive AI, SQLite, and ngrok.
+FastAPI, Twilio Voice + Media Streams, Google Cloud Speech-to-Text V2, OpenAI (or any OpenAI-compatible endpoint), Hive AI, SQLite, and ngrok.

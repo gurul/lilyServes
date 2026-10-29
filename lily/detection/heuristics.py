@@ -37,6 +37,20 @@ _RULES: list[tuple[str, int, re.Pattern]] = [
     # Medicare is NOT here: a pharmacy or clinic says "Medicare" in ordinary
     # calls. See "medicare id request" and the combination rule in score_text.
     ("gov impersonation", 3, re.compile(r"\b(?:irs|internal\s+revenue|social\s+security\s+administration)\b", _I)),
+    # FTC, gift card scams: "Only scammers will tell you to buy a gift card
+    # ... and give them the numbers off the back of the card."
+    # https://consumer.ftc.gov/articles/avoiding-and-reporting-gift-card-scams
+    # "Call the number on the back of your card" is the safe advice, so the
+    # rule needs a read-it-to-me verb and a card. The card security code
+    # ("three digits on the back") is our addition.
+    ("card numbers", 4, re.compile(
+        r"\b(?:(?:read|tell|send|text)\s+(?:me|us)|give\s+(?:me|us)\s+(?:the|those|that|all))\b"
+        r".{0,60}\b(?:numbers?|digits|codes?|pins?)\b.{0,40}\b(?:on|off|from)\s+the\s+(?:back|front)\s+of\s+"
+        r"(?:the|your|each|those|that|these)\s+(?:gift\s*)?cards?\b"
+        r"|\bcards?\b.{0,60}\b(?:read|tell|send|text)\s+(?:me|us)\b.{0,40}\b(?:numbers?|digits|codes?|pins?)\b"
+        r".{0,20}\b(?:on|off|from)\s+the\s+back\b"
+        r"|\b(?:gift\s*)?card\s+numbers?\s+and\s+(?:the\s+)?pins?\b"
+        r"|\b(?:three|3|four|4)\s+digits\s+on\s+the\s+back\b", _ID)),
     ("account credentials", 3, re.compile(r"\b(?:social\s+security|account|medicare)\s+number\b|\bpin\s+(?:number|code)\b|\bpassword\b|\bmother'?s\s+maiden\s+name\b", _I)),
     ("verification code", 4, re.compile(r"\b(?:verification|security|one[-\s]?time)\s+code\b|\bcode\s+(?:i|we)\s+(?:just\s+)?(?:sent|texted)\b|\b(?:four|five|six|4|5|6)[-\s]digit\s+(?:code|number)\b", _I)),
     # FTC, tech support scams: "If you call, the scammers ask for remote
@@ -183,6 +197,7 @@ THREAT_SIGNALS = frozenset({
 })
 CREDENTIAL_SIGNALS = frozenset({
     "account credentials",
+    "card numbers",
     "verification code",
     "remote access",
 })

@@ -168,8 +168,8 @@ def test_state_is_pure():
 
 
 def test_threshold_reached_despite_float_rounding():
-    # Exact EWMA is 0.6 (proofs/LilyProofs/Vectors.lean floatGap); float
-    # arithmetic gives 0.5999999999999999 and used to miss the hard alert.
+    # Exact EWMA is 0.6; float arithmetic gives 0.5999999999999999 and used
+    # to miss the hard alert.
     f = RiskFusion()
     f.on_deepfake(0.6)
     for score in (1, 9, 7):

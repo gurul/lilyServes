@@ -29,7 +29,8 @@ Sources and design choices (README "Research grounding" has the links):
   audio-deepfake detectors often rely on high-frequency features that
   natural corruptions or an attacker can easily manipulate.
 
-Invariants (checked by a formal model; keep these formulas exact):
+Invariants (tests/test_fusion_properties.py checks them over random call
+histories; keep these formulas exact):
 
 - Risk input:   r = min(1, score/10), score >= 0
                 r = max(r, VERDICT_RISK[llm_verdict])
@@ -67,8 +68,8 @@ THETA_ALERT = 0.60
 
 # Float slack for threshold checks. The EWMA of exact inputs can land one
 # rounding step below a threshold it reaches exactly (0.5999999999999999
-# for deepfake 0.6 then scores 1, 9, 7 — found by the Lean model in
-# proofs/). Erring by 1e-9 toward alerting is the safe side.
+# for deepfake 0.6 then scores 1, 9, 7). Erring by 1e-9 toward alerting
+# is the safe side.
 _EPS = 1e-9
 
 
@@ -87,6 +88,7 @@ PAYMENT_STAGE_SIGNALS = frozenset({
     "wire transfer",
     "crypto payment",
     "verification code",
+    "card numbers",
     "remote access",
     "secrecy",
     "courier/cash pickup",
