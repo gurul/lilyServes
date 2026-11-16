@@ -14,12 +14,10 @@ from __future__ import annotations
 import logging
 from xml.sax.saxutils import escape
 
+from lily.callers import is_withheld
 from lily.detection.heuristics import score_text
 
 log = logging.getLogger("lily.screening")
-
-# Twilio presents these for callers withholding caller ID.
-_ANONYMOUS = {"", "unknown", "anonymous", "restricted", "private", "unavailable", "+266696687"}
 
 ROUTE_PASS = "pass"
 ROUTE_SCREEN = "screen"
@@ -37,7 +35,8 @@ BLOCK_MESSAGE = "This number is not accepting your calls. Goodbye."
 
 
 def is_anonymous(caller: str | None) -> bool:
-    return (caller or "").strip().lower() in _ANONYMOUS
+    """Withheld caller ID. Same rule as every other guard: lily.callers."""
+    return is_withheld(caller)
 
 
 def decide_route(

@@ -12,6 +12,7 @@ import logging
 import math
 import time
 
+from lily.callers import is_withheld
 from lily.memory import lifecycle
 from lily.memory.embeddings import NullEmbedder, OpenAIEmbedder
 from lily.memory.models import Memory, MemoryStatus, MemoryType
@@ -186,6 +187,9 @@ class MemoryService:
             await lifecycle.maintain(self, memory, vectors[0] if vectors else None)
         except Exception:
             log.exception("lifecycle maintenance failed for %s", memory.id[:8])
+
+    async def get(self, memory_id: str) -> Memory | None:
+        return await self.db.get(memory_id)
 
     async def forget(self, memory_id: str) -> bool:
         """Delete a memory — "You own your data. Always."
@@ -402,7 +406,7 @@ class MemoryService:
         return await self.remember(
             summary,
             memory_type=memory_type,
-            entities=[caller] if caller and caller != "unknown" else [],
+            entities=[] if is_withheld(caller) else [caller],
             topics=["phone_call"] + (["scam_risk"] if scam_level != "Low" else []),
             importance=importance,
             caller=caller,
@@ -417,7 +421,7 @@ class MemoryService:
         return await self.remember(
             content,
             memory_type=MemoryType.COMMITMENT,
-            entities=[caller] if caller and caller != "unknown" else [],
+            entities=[] if is_withheld(caller) else [caller],
             topics=["commitment"],
             importance=0.8,
             caller=caller,

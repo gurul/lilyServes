@@ -18,8 +18,8 @@ A scam call only works while it is happening. By the time a transcript is review
 
 ## Features
 
-- **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. A caller with two scam strikes is blocked outright; a strike comes only from a declined screen or an LLM *scam* verdict, and withheld caller IDs never accrue strikes (one anonymous scammer must not block every withheld caller). Every screen shows up on the dashboard as a *Stayed safe* event.
-- **Live scam detection, research-grounded.** A sub-millisecond heuristic engine scores every sentence instantly. Its rules cover gift cards, wire transfers, crypto, urgency, secrecy, grandparent-scam patterns, remote-access and verification-code requests, requests to read back the numbers on a gift card or bank card, and the elder-fraud scripts that the FTC and FBI IC3 describe: Social Security benefit threats, jury-duty and arrest-warrant threats, couriers that pick up cash or gold, "protect your money" transfers, payment apps to "yourself", unauthorized-charge alerts, utility shutoff threats, refund and tech-support remote access, and guaranteed investment returns. A criteria-rubric LLM tier gives a scam / uncertain / safe verdict asynchronously, and malformed model output reads as uncertain, never safe. Signals fuse through a fixed-window EWMA with two thresholds. A payment-stage word alone gives Medium and an immediate LLM check; it escalates to a hard alert only when another signal, the LLM, or the EWMA corroborates it. The displayed risk level only escalates during a call (citations below).
+- **Call screening.** Trusted callers ring straight through. Restricted, anonymous, and first-time callers are answered by Lily first ("May I ask who's calling?"); the answer is risk-scored and the call is bridged or politely declined. A caller with two scam strikes is blocked outright; a strike comes only from a declined screen or an LLM *scam* verdict, and withheld caller IDs never accrue strikes (one anonymous scammer must not block every withheld caller). A withheld ID names nobody, so it also gets no profile card, no recalled memories and no last-call summary, and it cannot be marked trusted: one rule (`lily/callers.py`) decides what counts as withheld everywhere. Every screen shows up on the dashboard as a *Stayed safe* event.
+- **Live scam detection, research-grounded.** A sub-millisecond heuristic engine scores every sentence instantly. Its rules cover gift cards, wire transfers, crypto, urgency, secrecy, grandparent-scam patterns, remote-access and verification-code requests, requests to read back the numbers on a gift card or bank card, and the elder-fraud scripts that the FTC and FBI IC3 describe: Social Security benefit threats, jury-duty and arrest-warrant threats, couriers that pick up cash or gold, "protect your money" transfers, payment apps to "yourself", unauthorized-charge alerts, utility shutoff threats, refund and tech-support remote access, and guaranteed investment returns. A criteria-rubric LLM tier gives a scam / uncertain / safe verdict asynchronously, and malformed model output reads as uncertain, never safe. A failed model call is not a verdict: it reports `unavailable` (or `uncertain` when the regex tier is already loud), it never replaces a real earlier verdict, and `GET /health` reports `degraded`. Signals fuse through a fixed-window EWMA with two thresholds. The EWMA takes each sentence's own score, so one early signal fades as normal talk follows; the regex level over the whole transcript still escalates the call by itself. A payment-stage word alone gives Medium and an immediate LLM check; it escalates to a hard alert only when another signal, the LLM, or the EWMA corroborates it. The displayed risk level only escalates during a call (citations below).
 - **Deepfake detection.** The first ~10 seconds of caller audio go to Hive AI. A synthetic voice multiplies the transcript risk and alerts the family — urgently when the conversation is also suspicious — and can never *lower* a score.
 - **Cognitive continuity — lilyMemory.** A purpose-built long-term memory engine. Every call, commitment, trusted contact, extracted fact, and scam encounter becomes a typed memory (`episode` / `commitment` / `person` / `preference` / `win` / `safety`) with importance, confidence, entities, and topics. Recall is hybrid — semantic (embeddings + cosine) fused with lexical (entity-weighted FTS5 BM25), gated on relevance, shaded by type-aware recency, and MMR-diversified so near-duplicates never crowd the results. Alongside it, a structured SQLite store tracks caller history, trust, and scam strikes.
 - **A memory lifecycle that keeps memory honest.** Repeated observations *reinforce* the existing memory instead of duplicating it; a changed fact ("pickup moved to Saturday") *supersedes* the old one, which stays auditable but stops surfacing; commitments resolve their "Friday at 4 PM" into a real due date and *expire* after it passes (completing the reminder retires the memory too); low-importance chatter fades out while scam history never expires. All deterministic — no extra LLM calls — and `forget()` is always a hard delete.
@@ -27,7 +27,7 @@ A scam call only works while it is happening. By the time a transcript is review
 - **Event capture (Active Assistance).** "Main St. Pharmacy confirmed pickup for Friday @ 4:00 PM" becomes a structured reminder, extracted mid-call and pushed to the dashboard as an *Event captured* item. Post-call summaries also sweep for missed commitments.
 - **A scam call writes no reminders or memories.** A scammer's instructions sound like commitments ("buy the cards at Walgreens Friday at 3"), and "you've won a prize" sounds like good news. When a call reaches High risk, live or in the post-call summary, Lily stores no reminders, no extracted facts, and no good-news items from it. Reminders captured before the call turned High are closed, and `call_summary` lists their ids in `retired_events`. The call itself is kept as a `safety` memory.
 - **Family dashboard, smart updates.** Any number of clients connect over WebSocket and get a full snapshot plus live events. Every item carries an importance level (`info` / `notable` / `important` / `urgent`); only `important+` is flagged `notify: true` — peace of mind, not surveillance.
-- **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow). `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored — including every memory — passes through redaction that scrubs card numbers, SSNs, and one-time codes, and any memory can be deleted via the API (`DELETE /api/memories/{id}`). You own your data, always. `MEMORY_EMBEDDINGS=false` keeps memory fully offline (lexical recall only).
+- **Selective privacy.** `SHARE_TRANSCRIPTS=false` keeps transcript text off the dashboard (risk levels still flow), including what a screened caller said to Lily. `RETAIN_TRANSCRIPTS=false` (default) means transcripts are never persisted. Everything that *is* stored — including every memory — passes through redaction that scrubs card numbers, SSNs, and one-time codes, and any memory can be deleted via the API (`DELETE /api/memories/{id}`). Deleting a call's record also blanks that call's stored summary and transcript, its activity-feed details, and the caller's last-call summary when it was their latest call; deleting one fact or reminder blanks the activity rows that quote it. Deleted rows are overwritten (`secure_delete`). You own your data, always. `MEMORY_EMBEDDINGS=false` keeps memory fully offline (lexical recall only).
 - **Optional intervention.** With `AUTO_INTERVENE=true`, a call the LLM judges a scam is redirected to a polite hangup via the Twilio REST API. Off by default — warn, don't act.
 
 ## Latency model
@@ -77,13 +77,13 @@ cp .env.example .env                     # fill in the values
 python server.py
 ```
 
-On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — if Twilio credentials are present — points your Twilio number's voice webhook at `<public_url>/twiml`. Connect a dashboard to `wss://<public_url>/ws/client?token=<CLIENT_TOKEN>`, then call the number.
+The server listens on `127.0.0.1` by default; ngrok and a reverse proxy on the same host both reach it there. Set `HOST=0.0.0.0` for a container or a LAN deployment. On boot the server opens an ngrok tunnel (unless `PUBLIC_URL` is set), and — if Twilio credentials are present — points your Twilio number's voice webhook at `<public_url>/twiml`. Connect a dashboard to `wss://<public_url>/ws/client?token=<CLIENT_TOKEN>`, then call the number.
 
 ### Tests & lint
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 319 tests: heuristics, fusion, screening, memory, lifecycle, pipeline, audio, auth
+pytest          # 365 tests: heuristics, fusion, screening, memory, lifecycle, pipeline, audio, auth
 ruff check .
 ```
 
@@ -105,12 +105,13 @@ All configuration is environment variables (see `.env.example` for the full anno
 | `FORWARD_TO` | Yes | Number calls are bridged to |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | Recommended | Webhook auto-config **and webhook signature validation** — without the token, webhooks are unauthenticated (dev only) |
 | `CLIENT_TOKEN` | Recommended | Shared secret for the dashboard WS + REST; unset = open (dev only) |
-| `ALLOW_INSECURE_DEV` | No | Default `false` — the server refuses to start on a public URL or ngrok tunnel while `CLIENT_TOKEN` or `TWILIO_AUTH_TOKEN` is unset; `true` overrides that for local testing |
+| `ALLOW_INSECURE_DEV` | No | Default `false` — the server refuses to start on a public URL, an ngrok tunnel, or a non-loopback `HOST` while `CLIENT_TOKEN` or `TWILIO_AUTH_TOKEN` is unset; `true` overrides that for local testing |
 | `SCREEN_UNKNOWN_CALLERS` | No | Default `true` — Lily answers unknown callers first |
 | `TRUSTED_NUMBERS` | No | Comma-separated allowlist that always rings through |
 | `HIVE_API_SECRET` | No | Deepfake detection; skipped if unset |
-| `AUTO_INTERVENE` | No | Default `false` — hang up High-risk calls automatically |
+| `AUTO_INTERVENE` | No | Default `false` — hang up a call the LLM judges a scam. A regex-only High alerts the family and never ends a call |
 | `RETAIN_TRANSCRIPTS` / `SHARE_TRANSCRIPTS` | No | Privacy controls (persist / stream transcript text) |
+| `HOST` | No | Default `127.0.0.1`. Any other value (for example `0.0.0.0`) makes the server reachable from other machines, so the startup check then requires both secrets |
 | `PUBLIC_URL`, `NGROK_ENABLED`, `PORT`, `DATA_DIR`, `LOG_LEVEL` | No | Deployment knobs |
 | `SCAM_MODEL`, `SUMMARY_MODEL`, `EVENT_MODEL` | No | Model overrides |
 
@@ -120,8 +121,8 @@ All configuration is environment variables (see `.env.example` for the full anno
 |---|---|---|---|
 | `POST /twiml` | HTTP | Twilio signature | Voice webhook: screening decision → bridge / screen / block |
 | `POST /screen/result` | HTTP | Twilio signature | Screening answer assessment → bridge or decline |
-| `GET /health` | HTTP | — | Liveness, active calls, connected clients |
-| `/ws/twilio` | WebSocket | per-call `sig` | Twilio Media Streams ingress; `start` must carry the HMAC our TwiML issued for that CallSid |
+| `GET /health` | HTTP | — | Liveness, active calls, connected clients, and the state of the LLM tier (`status` is `degraded` while its last call failed) |
+| `/ws/twilio` | WebSocket | per-call `sig` | Twilio Media Streams ingress; `start` must carry the HMAC our TwiML issued for that CallSid, caller and screened flag, and a CallSid starts one stream only |
 | `/ws/client` | WebSocket | `?token=` | Dashboard egress: snapshot on connect, then live events |
 | `GET /api/activity` · `/api/events` · `/api/calls` | HTTP | `X-Lily-Token` | Activity feed, open reminders, call history |
 | `GET /api/caller/{number}` | HTTP | `X-Lily-Token` | Caller context + instant memory profile card |
@@ -155,6 +156,7 @@ lily/
 ├── config.py              env-driven settings
 ├── auth.py                Twilio signature validation, dashboard token check
 ├── calls.py               multi-call registry and per-call session state
+├── callers.py             the one rule for a withheld caller ID
 ├── hub.py                 dashboard fan-out + importance/notification tagging
 ├── screening.py           screening routes, answer assessment, TwiML builders
 ├── events.py              commitment extraction with a cheap trigger gate
@@ -173,7 +175,7 @@ lily/
     ├── service.py         hybrid recall facade (calibrated fusion, MMR, profile card)
     ├── lifecycle.py       dedupe-reinforce, supersession, expiry, when-text resolver
     └── operational.py     callers/calls/events/activity store; PII redaction
-tests/                     319 tests (no network required)
+tests/                     365 tests (no network required)
 scripts/eval_llm_tier.py   live LLM-tier eval (needs an API key)
 .github/workflows/ci.yml   ruff + pytest on Python 3.10, 3.12, 3.13
 ```
@@ -188,15 +190,15 @@ Each line states what the cited source reports, then what we built on it. Items 
 - **EWMA risk accumulation.** [arXiv:2509.05362](https://arxiv.org/abs/2509.05362) defines e₁ = S(m₁), eₜ = φ·S(mₜ) + (1−φ)·eₜ₋₁ with φ = 2/(T+1), and alerts at one threshold θ₁ = 0.7 (its θ₂ governs the scam-baiting agent, not alerting). We fix T at a 5-sentence window (φ = 1/3) because a live call has no final T, and we use two thresholds, 0.35 (Medium) and 0.60 (hard alert): *our design choices*.
 - **Payment-stage markers.** [arXiv:2605.12243](https://arxiv.org/abs/2605.12243) (PreScam) defines a scam kill chain and argues that a live system cannot always wait for the Termination phase, where the scammer asks for payment, before it flags a conversation. A lone payment word gives Medium plus an immediate LLM check, and a corroborated one gives a hard alert: *our design choice*.
 - **Deepfake score as a risk multiplier, not a standalone alarm** is our design choice. [arXiv:2411.00121](https://arxiv.org/abs/2411.00121) finds that state-of-the-art audio-deepfake detectors often rely on high-frequency features that natural corruptions or an attacker can easily manipulate.
-- **PII sanitization before any cloud LLM call.** [arXiv:2510.18493](https://arxiv.org/abs/2510.18493) (MASK) proposes sanitizing call transcripts because they often contain sensitive personal information that third-party providers may see during processing.
+- **PII sanitization before every cloud LLM call** (scam verdict, post-call summary, reminder extraction; `tests/test_judge_regressions.py` checks all three). [arXiv:2510.18493](https://arxiv.org/abs/2510.18493) (MASK) proposes sanitizing call transcripts because they often contain sensitive personal information that third-party providers may see during processing.
 - **Heuristic rule families** cite their source in `lily/detection/heuristics.py`: the FTC gift-card page ("Only scammers will tell you to buy a gift card … and give them the numbers off the back of the card"), FTC consumer alerts on Social Security, jury-duty, utility, payment-app, tech-support, investment, and "move your money to protect it" scams, the FBI IC3 courier PSA ([PSA240129](https://www.ic3.gov/PSA/2024/PSA240129)), and the [FBI IC3 2024 Internet Crime Report](https://www.ic3.gov/AnnualReport/Reports/2024_IC3Report.pdf), which lists Tech Support ($982,440,006) and Government Impersonation ($208,096,366) losses for complainants over 60. Rule weights are our design choice.
 
 ## Security & privacy posture
 
 - Twilio webhooks are HMAC-validated (`X-Twilio-Signature`) whenever `TWILIO_AUTH_TOKEN` is set; unset is loudly logged as dev mode.
-- Dashboard WS and REST require `CLIENT_TOKEN` (constant-time compare). REST takes it only in the `X-Lily-Token` header; `/ws/client` takes `?token=` because browsers cannot set WebSocket headers, and the access log masks it. A public URL with no token refuses to start unless `ALLOW_INSECURE_DEV=true`.
-- Media streams must present an HMAC-SHA256 of the CallSid, keyed with `TWILIO_AUTH_TOKEN`, that only our TwiML issues, so a forged stream cannot open a session or strike a number. The `X-Twilio-Signature` on the WebSocket handshake is checked and logged but not enforced, because Twilio's docs do not pin the signed URL form.
-- Minimal retention by default: no transcript persistence, summaries only, all stored text redacted (cards / SSNs / one-time codes).
+- Dashboard WS and REST require `CLIENT_TOKEN` (constant-time compare). REST takes it only in the `X-Lily-Token` header; `/ws/client` takes `?token=` because browsers cannot set WebSocket headers, and both uvicorn loggers mask it (uvicorn writes WebSocket handshakes to `uvicorn.error`, not to the access log). A server that other machines can reach (public URL, ngrok, or a non-loopback `HOST`) refuses to start without both secrets unless `ALLOW_INSECURE_DEV=true`.
+- Media streams must present an HMAC-SHA256 over the CallSid, the caller number and the screened flag, keyed with `TWILIO_AUTH_TOKEN`, that only our TwiML issues, so a forged stream cannot open a session or strike a number, and a captured `sig` cannot be reused for another caller. A CallSid is accepted once: a replayed `start` is refused and the first call's record is kept. The `X-Twilio-Signature` on the WebSocket handshake is checked and logged but not enforced, because Twilio's docs do not pin the signed URL form.
+- Minimal retention by default: no transcript persistence, summaries only, all stored text redacted (cards / SSNs / one-time codes). The same redaction runs on every transcript before it goes to the model provider.
 - No phone numbers or secrets in source; everything comes from the environment.
 
 ## Known limitations

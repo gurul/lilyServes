@@ -101,17 +101,24 @@ def verify_twilio_ws_signature(websocket: WebSocket) -> bool:
     )
 
 
-def stream_param_sig(auth_token: str, call_sid: str) -> str:
-    """HMAC-SHA256(auth_token, CallSid) hex, sent as the Stream "sig" parameter."""
-    return hmac.new(auth_token.encode(), call_sid.encode("utf-8"), hashlib.sha256).hexdigest()
+def stream_param_sig(auth_token: str, call_sid: str, caller: str = "", screened: bool = False) -> str:
+    """HMAC-SHA256 hex over the CallSid, the caller and the screened flag.
+
+    Sent as the Stream "sig" parameter. All three values ride in the same
+    TwiML, so the signature covers all three: a valid `sig` cannot be reused
+    with another caller number or with the screened flag flipped. Each part
+    is length-prefixed, so no two different triples sign the same bytes."""
+    parts = (call_sid, caller, "1" if screened else "0")
+    payload = "".join(f"{len(p.encode('utf-8'))}:{p}" for p in parts)
+    return hmac.new(auth_token.encode(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def verify_stream_param_sig(call_sid: str, sig: str) -> bool:
+def verify_stream_param_sig(call_sid: str, sig: str, caller: str = "", screened: bool = False) -> bool:
     """Check the "sig" custom parameter on a media stream `start` event."""
     token = settings.twilio_auth_token
     if not token:
         return True
-    return _equal(stream_param_sig(token, call_sid), sig or "")
+    return _equal(stream_param_sig(token, call_sid, caller, screened), sig or "")
 
 
 _TOKEN_IN_QUERY = re.compile(r"([?&]token=)[^&\s\"]*")
@@ -122,7 +129,7 @@ def mask_token(text: str) -> str:
 
 
 class TokenMaskFilter(logging.Filter):
-    """Mask ?token=... in uvicorn access-log lines (/ws/client carries it)."""
+    """Mask ?token=... in uvicorn log lines (/ws/client carries it)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple):
@@ -132,7 +139,14 @@ class TokenMaskFilter(logging.Filter):
         return True
 
 
+# uvicorn writes HTTP requests to "uvicorn.access" and WebSocket handshakes
+# ('%s - "WebSocket %s" [accepted]', and the 403 line) to "uvicorn.error".
+# /ws/client is a WebSocket, so the token is on the second one.
+_TOKEN_LOGGERS = ("uvicorn.access", "uvicorn.error")
+
+
 def install_access_log_filter() -> None:
-    access = logging.getLogger("uvicorn.access")
-    if not any(isinstance(f, TokenMaskFilter) for f in access.filters):
-        access.addFilter(TokenMaskFilter())
+    for name in _TOKEN_LOGGERS:
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, TokenMaskFilter) for f in logger.filters):
+            logger.addFilter(TokenMaskFilter())

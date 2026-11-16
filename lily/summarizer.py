@@ -8,6 +8,7 @@ import os
 import openai
 
 from lily.config import settings
+from lily.memory.operational import redact
 
 log = logging.getLogger("lily.summarizer")
 
@@ -58,7 +59,8 @@ def sanitize_summary(result: dict) -> dict:
 
 
 async def generate_summary(transcript_lines: list[str]) -> dict:
-    """Structured post-call analysis. Never raises; returns a fallback dict."""
+    """Structured post-call analysis over a PII-sanitized transcript. Never
+    raises; returns a fallback dict."""
     if not transcript_lines:
         return dict(_FALLBACK)
 
@@ -67,7 +69,7 @@ async def generate_summary(transcript_lines: list[str]) -> dict:
             model=settings.summary_model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "\n".join(transcript_lines)},
+                {"role": "user", "content": redact("\n".join(transcript_lines))},
             ],
             temperature=0.2,
             max_tokens=500,

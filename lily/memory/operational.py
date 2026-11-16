@@ -21,6 +21,8 @@ import sqlite3
 import time
 from typing import Any
 
+from lily.callers import is_withheld
+
 log = logging.getLogger("lily.store")
 
 _SCHEMA = """
@@ -135,6 +137,9 @@ class MemoryStore:
         conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # A deleted or scrubbed row is overwritten with zeros, not left in a
+        # free page: https://www.sqlite.org/pragma.html#pragma_secure_delete
+        conn.execute("PRAGMA secure_delete=ON")
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
         # events.memory_id links an event to its COMMITMENT memory twin so
@@ -167,7 +172,14 @@ class MemoryStore:
     # ----- callers -----------------------------------------------------------
 
     async def caller_context(self, number: str) -> dict:
-        """Everything Lily remembers about a caller, for gentle context."""
+        """Everything Lily remembers about a caller, for gentle context.
+
+        A withheld caller ID names nobody, so it never has a context: the
+        last summary, name and strikes of one withheld caller must not show
+        on the next one's call."""
+        if is_withheld(number):
+            return {"known": False, "number": number}
+
         def q(conn: sqlite3.Connection):
             caller = conn.execute(
                 "SELECT * FROM callers WHERE number = ?", (number,)
@@ -195,6 +207,8 @@ class MemoryStore:
         }
 
     async def touch_caller(self, number: str) -> None:
+        if is_withheld(number):
+            return
         now = time.time()
 
         def w(conn: sqlite3.Connection):
@@ -209,6 +223,8 @@ class MemoryStore:
         await self._run(w)
 
     async def set_trusted(self, number: str, trusted: bool, name: str = "") -> None:
+        if is_withheld(number):
+            raise ValueError("a withheld caller ID cannot be trusted")
         now = time.time()
 
         def w(conn: sqlite3.Connection):
@@ -242,16 +258,22 @@ class MemoryStore:
 
     # ----- calls -------------------------------------------------------------
 
-    async def record_call_start(self, call_sid: str, number: str, screened: bool) -> None:
+    async def record_call_start(self, call_sid: str, number: str, screened: bool) -> bool:
+        """Claim a CallSid. Returns False when it was seen before.
+
+        Twilio never reuses a CallSid, so a second `start` for one is a
+        replayed stream. The first record is kept: a replay cannot overwrite
+        a real call's row."""
         def w(conn: sqlite3.Connection):
-            conn.execute(
-                "INSERT OR REPLACE INTO calls (call_sid, number, started_at, screened) "
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO calls (call_sid, number, started_at, screened) "
                 "VALUES (?, ?, ?, ?)",
                 (call_sid, number, time.time(), int(screened)),
             )
             conn.commit()
+            return cur.rowcount > 0
 
-        await self._run(w)
+        return await self._run(w)
 
     async def record_call_end(
         self,
@@ -273,12 +295,55 @@ class MemoryStore:
                 "summary_json = ?, transcript = ? WHERE call_sid = ?",
                 (time.time(), scam_level, deepfake_score, summary_text, transcript, call_sid),
             )
+            if not is_withheld(number):
+                conn.execute(
+                    "INSERT INTO callers (number, first_seen, last_seen, last_summary) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(number) DO UPDATE SET last_summary = excluded.last_summary",
+                    (number, time.time(), time.time(), redact(str(summary.get("summary", "")))),
+                )
+            conn.commit()
+
+        await self._run(w)
+
+    async def scrub_call(self, call_sid: str, text: str = "") -> None:
+        """Remove what a deleted memory left in the operational tables.
+
+        With no `text` the memory was the call's own record: blank the call's
+        summary and transcript, every activity detail of the call, and the
+        caller's last summary when this was their latest call. With `text`
+        the memory was one fact or reminder from the call: blank only the
+        activity rows of that call that quote it."""
+        if not call_sid:
+            return
+        needle = redact(text).strip()
+
+        def w(conn: sqlite3.Connection):
+            if needle:
+                rows = conn.execute(
+                    "SELECT id, detail FROM activity WHERE call_sid = ?", (call_sid,)
+                ).fetchall()
+                ids = [r["id"] for r in rows if needle.lower() in (r["detail"] or "").lower()]
+                conn.executemany("UPDATE activity SET detail = '' WHERE id = ?", [(i,) for i in ids])
+                conn.commit()
+                return
+            call = conn.execute(
+                "SELECT number FROM calls WHERE call_sid = ?", (call_sid,)
+            ).fetchone()
             conn.execute(
-                "INSERT INTO callers (number, first_seen, last_seen, last_summary) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(number) DO UPDATE SET last_summary = excluded.last_summary",
-                (number, time.time(), time.time(), redact(str(summary.get("summary", "")))),
+                "UPDATE calls SET summary_json = '', transcript = '' WHERE call_sid = ?",
+                (call_sid,),
             )
+            conn.execute("UPDATE activity SET detail = '' WHERE call_sid = ?", (call_sid,))
+            if call is not None and call["number"]:
+                latest = conn.execute(
+                    "SELECT call_sid FROM calls WHERE number = ? ORDER BY started_at DESC LIMIT 1",
+                    (call["number"],),
+                ).fetchone()
+                if latest is not None and latest["call_sid"] == call_sid:
+                    conn.execute(
+                        "UPDATE callers SET last_summary = '' WHERE number = ?", (call["number"],)
+                    )
             conn.commit()
 
         await self._run(w)

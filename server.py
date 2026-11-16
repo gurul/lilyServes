@@ -6,4 +6,4 @@ if __name__ == "__main__":
 
     from lily.config import settings
 
-    uvicorn.run("lily.app:app", host="0.0.0.0", port=settings.port, reload=False)
+    uvicorn.run("lily.app:app", host=settings.host, port=settings.port, reload=False)

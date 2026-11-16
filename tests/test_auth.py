@@ -43,5 +43,11 @@ def test_stream_param_sig_is_hmac_sha256_hex():
 
     from lily.auth import stream_param_sig
 
-    expected = hmac.new(b"tok", b"CA123", hashlib.sha256).hexdigest()
-    assert stream_param_sig("tok", "CA123") == expected
+    # Length-prefixed CallSid, caller and screened flag: the sig covers all
+    # three, so it cannot be replayed with another caller or flag.
+    expected = hmac.new(b"tok", b"5:CA12312:+155500011111:1", hashlib.sha256).hexdigest()
+    assert stream_param_sig("tok", "CA123", "+15550001111", True) == expected
+    assert stream_param_sig("tok", "CA123", "+15550001111", False) != expected
+    assert stream_param_sig("tok", "CA123", "+15550002222", True) != expected
+    # No two different triples sign the same bytes.
+    assert stream_param_sig("tok", "CA1", "23") != stream_param_sig("tok", "CA12", "3")

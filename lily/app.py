@@ -39,10 +39,11 @@ from lily.auth import (
     verify_stream_param_sig,
     verify_twilio_ws_signature,
 )
+from lily.callers import is_withheld
 from lily.calls import CallExistsError, CallSession, registry
 from lily.config import settings
 from lily.detection.deepfake import check_deepfake, close_http
-from lily.detection.detector import analyze_scam
+from lily.detection.detector import analyze_scam, llm_state
 from lily.detection.heuristics import max_level, score_text
 from lily.events import extract_events, has_event_trigger
 from lily.hub import IMPORTANT, INFO, NOTABLE, URGENT, hub, push_activity
@@ -131,13 +132,21 @@ async def lifespan(app: FastAPI):
         ngrok.disconnect(tunnel.public_url)
 
 
-def check_exposure() -> None:
-    """Refuse to start on a public URL without auth secrets.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-    A public URL is PUBLIC_URL, or the ngrok tunnel that opens when it is
-    unset. ALLOW_INSECURE_DEV=true overrides the check for local demos.
+
+def check_exposure() -> None:
+    """Refuse to start without auth secrets when other machines can connect.
+
+    Reachable means PUBLIC_URL, the ngrok tunnel that opens when it is unset,
+    or a HOST that is not loopback (0.0.0.0 serves the whole LAN).
+    ALLOW_INSECURE_DEV=true overrides the check for local demos.
     """
-    exposed = bool(settings.public_url) or settings.ngrok_enabled
+    exposed = (
+        bool(settings.public_url)
+        or settings.ngrok_enabled
+        or settings.host.strip().lower() not in _LOOPBACK_HOSTS
+    )
     if not exposed or settings.allow_insecure_dev:
         return
     missing = [
@@ -148,8 +157,9 @@ def check_exposure() -> None:
     ]
     if missing:
         raise RuntimeError(
-            f"{' and '.join(missing)} unset while the server is publicly reachable "
-            "(PUBLIC_URL or ngrok). Set them, or set ALLOW_INSECURE_DEV=true for local dev only."
+            f"{' and '.join(missing)} unset while the server is reachable from other "
+            "machines (PUBLIC_URL, ngrok, or a non-loopback HOST). Set them, or set "
+            "ALLOW_INSECURE_DEV=true for local dev only."
         )
 
 
@@ -185,10 +195,20 @@ async def require_client_token(request: Request) -> None:
 
 @app.get("/health")
 async def health():
+    # The LLM tier decides negatives. If its last call failed, say so here:
+    # a wrong key or an empty balance must not look like a healthy quiet day.
+    ok_at, error_at = llm_state["last_ok_at"], llm_state["last_error_at"]
+    llm_failing = error_at is not None and (ok_at is None or error_at > ok_at)
     return {
-        "status": "ok",
+        "status": "degraded" if llm_failing else "ok",
         "active_calls": len(registry),
         "clients": hub.client_count,
+        "llm": {
+            "ok": not llm_failing,
+            "last_ok_at": ok_at,
+            "last_error_at": error_at,
+            "last_error": llm_state["last_error"] if llm_failing else "",
+        },
     }
 
 
@@ -199,9 +219,9 @@ def _ws_url(request: Request) -> str:
     return stream_url(base, "")
 
 
-def _stream_sig(call_sid: str) -> str:
+def _stream_sig(call_sid: str, caller: str, screened: bool) -> str:
     token = settings.twilio_auth_token
-    return stream_param_sig(token, call_sid) if token and call_sid else ""
+    return stream_param_sig(token, call_sid, caller, screened) if token and call_sid else ""
 
 
 @app.post("/twiml")
@@ -239,7 +259,7 @@ async def twiml(request: Request, form: dict = Depends(require_twilio_signature)
     # screen must not earn the known-caller pass by redialing.
     _spawn(store.touch_caller(caller))
     xml = screening.twiml_pass(
-        _ws_url(request), settings.forward_to, caller, screened=False, sig=_stream_sig(call_sid)
+        _ws_url(request), settings.forward_to, caller, screened=False, sig=_stream_sig(call_sid, caller, False)
     )
     return PlainTextResponse(xml, media_type="application/xml")
 
@@ -265,15 +285,18 @@ async def screen_result(request: Request, form: dict = Depends(require_twilio_si
         ))
         return PlainTextResponse(screening.twiml_reject(), media_type="application/xml")
 
+    # The caller's answer is transcript text: it follows SHARE_TRANSCRIPTS.
+    detail = (
+        f"Caller said: “{redact(speech)}” — call connected and being monitored."
+        if settings.share_transcripts
+        else "Call connected and being monitored."
+    )
     _spawn(push_activity(
-        "screen_passed",
-        "Screened caller connected",
-        f"Caller said: “{redact(speech)}” — call connected and being monitored.",
-        INFO, call_sid, store,
+        "screen_passed", "Screened caller connected", detail, INFO, call_sid, store,
     ))
     _spawn(store.touch_caller(caller))
     xml = screening.twiml_pass(
-        _ws_url(request), settings.forward_to, caller, screened=True, sig=_stream_sig(call_sid)
+        _ws_url(request), settings.forward_to, caller, screened=True, sig=_stream_sig(call_sid, caller, True)
     )
     return PlainTextResponse(xml, media_type="application/xml")
 
@@ -308,18 +331,22 @@ async def twilio_ws(websocket: WebSocket):
                 start = msg["start"]
                 sid = start["callSid"]
                 params = start.get("customParameters") or {}
-                if not verify_stream_param_sig(sid, params.get("sig", "")):
+                raw_caller = str(params.get("caller") or "")
+                screened = params.get("screened") == "1"
+                # The sig covers the caller and the screened flag too: a
+                # captured sig cannot start a stream that names another number.
+                if not verify_stream_param_sig(sid, params.get("sig", ""), raw_caller, screened):
                     log.warning("rejected media stream start with bad sig for call_sid=%s", sid)
                     await websocket.close(code=1008)
                     return
-                caller = params.get("caller") or "unknown"
-                screened = params.get("screened") == "1"
+                caller = raw_caller or "unknown"
                 call_sid = sid
                 try:
                     await _begin_call(call_sid, caller, screened)
                 except CallExistsError:
-                    # Another socket owns this call; never finalize it from here.
-                    log.warning("rejected media stream for already-active call_sid=%s", sid)
+                    # Another socket owns this call, or the CallSid was used
+                    # before (a replay); never finalize it from here.
+                    log.warning("rejected media stream for active or replayed call_sid=%s", sid)
                     call_sid = None
                     await websocket.close(code=1008)
                     return
@@ -354,6 +381,17 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
     log.info("stream started call_sid=%s caller=%s screened=%s", call_sid, caller, screened)
     session = registry.create(call_sid, caller)
     session.screened = screened
+    # Claim the CallSid before anything else runs. Twilio never reuses one,
+    # so a second start for it is a replayed stream: refuse it, and keep the
+    # first call's record.
+    try:
+        claimed = await store.record_call_start(call_sid, caller, screened)
+    except Exception:
+        registry.pop(call_sid)
+        raise
+    if not claimed:
+        registry.pop(call_sid)
+        raise CallExistsError(call_sid)
 
     async def on_final(text: str, full_transcript: str, _sid=call_sid):
         await _on_final_line(_sid, text, full_transcript)
@@ -376,15 +414,14 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
     )
     await session.stream_session.start()
 
-    _spawn(store.record_call_start(call_sid, caller, screened))
-
     # Cognitive continuity: give the dashboard gentle context about who this is.
     ctx = await store.caller_context(caller)
     # Profile card is pure indexed SQL — instant, no embedding round-trip.
-    # Withheld caller IDs share one bucket; a card for it would cross-pollinate
-    # unrelated callers.
+    # Withheld caller IDs share one bucket; a card or a recall for it would
+    # show one unrelated caller's memories on another's call.
+    withheld = is_withheld(caller)
     card = None
-    if caller.lower() not in ("unknown", "anonymous"):
+    if not withheld:
         try:
             card = await memory.profile(caller, ctx.get("name", ""))
         except Exception:
@@ -399,7 +436,8 @@ async def _begin_call(call_sid: str, caller: str, screened: bool) -> None:
     }, NOTABLE)
     # Long-term memories arrive as a follow-up so the embedding round-trip
     # never delays the call_started push.
-    _spawn(_recall_caller_memories(call_sid, caller, ctx.get("name", "")))
+    if not withheld:
+        _spawn(_recall_caller_memories(call_sid, caller, ctx.get("name", "")))
 
 
 async def _recall_caller_memories(call_sid: str, caller: str, name: str) -> None:
@@ -424,10 +462,18 @@ async def _on_final_line(call_sid: str, text: str, full_transcript: str) -> None
         return
     session.transcript.append(text)
 
-    # Cumulative heuristics feed the EWMA fusion; the regex tier escalates
-    # but never clears (displayed level stays monotonic per call).
+    # The regex tier scores the whole transcript: its level escalates and
+    # never clears (the displayed level stays monotonic per call), and its
+    # signals feed corroboration. The EWMA takes one sentence's risk at a
+    # time (arXiv:2509.05362 Eq. 2, S(m_t)): the score of this sentence
+    # alone, or what it added to the whole-transcript score when a pattern
+    # completed across sentences. Feeding the cumulative score every time
+    # would add one early signal again on every later sentence, and a long
+    # normal call would climb to the alert threshold.
     heur = score_text(full_transcript)
-    state = session.fusion.on_sentence(heur)
+    sentence_score = max(score_text(text).score, heur.score - session.heuristic_score)
+    session.heuristic_score = heur.score
+    state = session.fusion.on_sentence(heur._replace(score=sentence_score))
     session.scam_level = max_level(session.scam_level, heur.level, state.level)
     session.heuristic_signals = heur.signals
 
@@ -477,7 +523,12 @@ async def _refine_scam(call_sid: str) -> None:
             if registry.get(call_sid) is None:
                 return
             previous = session.scam_level
-            state = session.fusion.on_llm(result["verdict"])
+            # A failed model call is not a verdict: it must not replace a
+            # real earlier one, or clear a payment marker.
+            if result.get("available", True):
+                state = session.fusion.on_llm(result["verdict"])
+            else:
+                state = session.fusion.state()
             session.scam_level = max_level(session.scam_level, state.level)
             session.scam_reasoning = result["reasoning"]
             await hub.broadcast({
@@ -626,7 +677,7 @@ def _capture_facts(call_sid: str, caller: str, facts: list) -> None:
     """Durable facts piggybacked on the summary call — zero marginal LLM cost."""
     if not isinstance(facts, list):
         return
-    if caller.lower() in ("unknown", "anonymous"):
+    if is_withheld(caller):
         # Withheld caller IDs share one bucket — never attribute facts to it.
         caller = ""
     seen: set[str] = set()
@@ -812,6 +863,9 @@ async def api_set_trusted(payload: dict):
     if not number:
         raise HTTPException(status_code=422, detail="number required")
     trusted = bool(payload.get("trusted", True))
+    if is_withheld(number):
+        # Every withheld caller shares this ID: trusting it would pass them all.
+        raise HTTPException(status_code=422, detail="a withheld caller ID cannot be trusted")
     name = str(payload.get("name", ""))
     note = str(payload.get("note", ""))
     await store.set_trusted(number, trusted, name)
@@ -866,10 +920,18 @@ async def api_memories_search(q: str, limit: int = 10, caller: str = ""):
 
 @app.delete("/api/memories/{memory_id}", dependencies=[Depends(require_client_token)])
 async def api_memories_delete(memory_id: str):
-    """You own your data — any memory can be deleted."""
+    """You own your data — any memory can be deleted.
+
+    The same text can also sit in the operational tables (the call's summary,
+    the activity feed, the caller's last summary). Deleting the memory
+    removes it there too, or GET /api/calls would still return it."""
+    target = await memory.get(memory_id)
     deleted = await memory.forget(memory_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="memory not found")
+    if target is not None and target.call_sid:
+        is_call_record = "phone_call" in target.topics
+        await store.scrub_call(target.call_sid, "" if is_call_record else target.content)
     return {"ok": True}
 
 
@@ -878,4 +940,4 @@ async def api_memories_delete(memory_id: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("lily.app:app", host="0.0.0.0", port=settings.port, reload=False)
+    uvicorn.run("lily.app:app", host=settings.host, port=settings.port, reload=False)

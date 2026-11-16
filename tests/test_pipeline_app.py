@@ -189,11 +189,14 @@ def test_ws_twilio_unsigned_handshake_cannot_start_a_call(client, monkeypatch):
 def test_ws_twilio_handshake_accepts_valid_signature(client, monkeypatch, signed_url):
     monkeypatch.setattr(settings, "twilio_auth_token", TW_TOKEN)
     sig = compute_twilio_signature(TW_TOKEN, signed_url, {})
+    # A CallSid is accepted once (a second start for it is a replay), so each
+    # case uses its own.
+    sid = "CAok" + str(len(signed_url))
     with client.websocket_connect("/ws/twilio", headers={"X-Twilio-Signature": sig}) as ws:
-        ws.send_text(_start("CAok", "+15550001112", stream_param_sig(TW_TOKEN, "CAok")))
-        assert _wait(lambda: app_mod.registry.get("CAok") is not None)
+        ws.send_text(_start(sid, "+15550001112", stream_param_sig(TW_TOKEN, sid, "+15550001112")))
+        assert _wait(lambda: app_mod.registry.get(sid) is not None)
         ws.send_text(STOP)
-    assert _wait(lambda: app_mod.registry.get("CAok") is None)
+    assert _wait(lambda: app_mod.registry.get(sid) is None)
 
 
 def test_ws_twilio_start_with_bad_sig_param_is_closed(client, monkeypatch):
@@ -208,11 +211,55 @@ def test_ws_twilio_start_with_bad_sig_param_is_closed(client, monkeypatch):
     assert FakeSTT.instances == []
 
 
+def test_ws_twilio_captured_sig_cannot_name_another_caller(client, monkeypatch):
+    """A sig taken from one call's TwiML does not start a stream that claims
+    another number, or that flips the screened flag."""
+    monkeypatch.setattr(settings, "twilio_auth_token", TW_TOKEN)
+    handshake = {"X-Twilio-Signature": compute_twilio_signature(TW_TOKEN, WSS, {})}
+    captured = stream_param_sig(TW_TOKEN, "CAswap", "+15550001115", False)
+    forged = (
+        {"caller": "+15550009999", "sig": captured},
+        {"caller": "+15550001115", "screened": "1", "sig": captured},
+    )
+    for params in forged:
+        with client.websocket_connect("/ws/twilio", headers=handshake) as ws:
+            ws.send_text(json.dumps(
+                {"event": "start", "start": {"callSid": "CAswap", "customParameters": params}}
+            ))
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_text()
+        assert app_mod.registry.get("CAswap") is None
+    assert FakeSTT.instances == []
+
+
+def test_ws_twilio_replayed_start_is_closed_and_keeps_the_first_record(client, monkeypatch):
+    """A CallSid starts one stream. Replaying its start after the call ended
+    is refused, and the first call's stored record is not overwritten."""
+    monkeypatch.setattr(settings, "twilio_auth_token", TW_TOKEN)
+    handshake = {"X-Twilio-Signature": compute_twilio_signature(TW_TOKEN, WSS, {})}
+    start = _start("CAreplay", "+15550001116", stream_param_sig(TW_TOKEN, "CAreplay", "+15550001116"))
+    with client.websocket_connect("/ws/twilio", headers=handshake) as ws:
+        ws.send_text(start)
+        assert _wait(lambda: app_mod.registry.get("CAreplay") is not None)
+        ws.send_text(STOP)
+    assert _wait(lambda: app_mod.registry.get("CAreplay") is None)
+    streams = len(FakeSTT.instances)
+
+    with client.websocket_connect("/ws/twilio", headers=handshake) as ws:
+        ws.send_text(start)
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+    assert app_mod.registry.get("CAreplay") is None
+    assert len(FakeSTT.instances) == streams
+    calls = client.portal.call(app_mod.store.recent_calls, 100)
+    assert [c["call_sid"] for c in calls].count("CAreplay") == 1
+
+
 def test_twiml_bridge_carries_callsid_hmac(client, monkeypatch):
     monkeypatch.setattr(settings, "twilio_auth_token", TW_TOKEN)
     monkeypatch.setattr(settings, "trusted_numbers", ["+15550001114"])
     body = _post(client, "/twiml", {"From": "+15550001114", "CallSid": "CAsig"}).text
-    assert f'<Parameter name="sig" value="{stream_param_sig(TW_TOKEN, "CAsig")}" />' in body
+    assert f'<Parameter name="sig" value="{stream_param_sig(TW_TOKEN, "CAsig", "+15550001114", False)}" />' in body
 
 
 def test_forged_stream_cannot_strike_victim(client, monkeypatch):
@@ -402,19 +449,33 @@ def test_ws_client_still_accepts_query_token(client, monkeypatch):
         assert json.loads(ws.receive_text())["event"] == "snapshot"
 
 
-def test_access_log_masks_query_token():
-    access = logging.getLogger("uvicorn.access")
-    record = logging.LogRecord(
-        "uvicorn.access", logging.INFO, __file__, 1,
-        '%s - "%s %s HTTP/%s" %d',
-        ("127.0.0.1:5000", "GET", "/ws/client?a=1&token=s3cret&b=2", "1.1", 101),
-        None,
-    )
-    for f in access.filters:
-        f.filter(record)
-    line = record.getMessage()
-    assert "s3cret" not in line
-    assert "token=***" in line and "b=2" in line
+@pytest.mark.parametrize("logger_name,fmt,args", [
+    ("uvicorn.access", '%s - "%s %s HTTP/%s" %d',
+     ("127.0.0.1:5000", "GET", "/ws/client?a=1&token=s3cret&b=2", "1.1", 101)),
+    # uvicorn logs the WebSocket handshake itself on "uvicorn.error".
+    ("uvicorn.error", '%s - "WebSocket %s" [accepted]',
+     ("127.0.0.1:5000", "/ws/client?a=1&token=s3cret&b=2")),
+])
+def test_uvicorn_logs_mask_query_token(logger_name, fmt, args):
+    # Through the real logger: its own filters decide what a handler sees.
+    lines: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger(logger_name)
+    handler, previous = Capture(), logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        logger.info(fmt, *args)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    assert len(lines) == 1
+    assert "s3cret" not in lines[0]
+    assert "token=***" in lines[0] and "b=2" in lines[0]
 
 
 # ----- Fix 10: strike policy ---------------------------------------------------------

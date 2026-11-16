@@ -21,6 +21,7 @@ import logging
 import re
 import time
 
+from lily.callers import WITHHELD_CALLERS, is_withheld
 from lily.memory.models import Memory, MemoryStatus, MemoryType
 
 log = logging.getLogger("lily.memory.lifecycle")
@@ -28,16 +29,13 @@ log = logging.getLogger("lily.memory.lifecycle")
 # Twilio collapses every withheld caller ID onto shared constants, and the app
 # maps withheld callers to "". None of these is an identity: facts from one
 # withheld call must never merge into or supersede another caller's facts.
-ANON_CALLERS = frozenset({
-    "", "unknown", "anonymous", "restricted", "private", "unavailable",
-    "blocked", "withheld",
-})
+ANON_CALLERS = WITHHELD_CALLERS
 
 
 def is_withheld_caller(caller: str | None) -> bool:
     """True when `caller` names no real identity (empty or a withheld-ID
     placeholder). The single test every caller-identity guard uses."""
-    return (caller or "").strip().lower() in ANON_CALLERS
+    return is_withheld(caller)
 
 DAY = 86400.0
 

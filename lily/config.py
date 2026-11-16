@@ -19,6 +19,10 @@ def _csv(name: str) -> list[str]:
 
 @dataclass
 class Settings:
+    # Loopback by default: ngrok and a same-host reverse proxy both reach it.
+    # A container or a LAN deployment sets HOST=0.0.0.0, and that counts as
+    # reachable in the startup exposure check.
+    host: str = "127.0.0.1"
     port: int = 8000
     forward_to: str = ""
     project_id: str = "heylily"
@@ -41,8 +45,9 @@ class Settings:
     # Shared secret: X-Lily-Token header on dashboard REST, ?token= on /ws/client.
     client_token: str = ""
 
-    # A public URL (PUBLIC_URL or ngrok) with an empty CLIENT_TOKEN or
-    # TWILIO_AUTH_TOKEN refuses to start unless this is set.
+    # A reachable server (PUBLIC_URL, ngrok, or a non-loopback HOST) with an
+    # empty CLIENT_TOKEN or TWILIO_AUTH_TOKEN refuses to start unless this is
+    # set.
     allow_insecure_dev: bool = False
 
     data_dir: str = "data"
@@ -55,8 +60,9 @@ class Settings:
     screen_unknown_callers: bool = True
     trusted_numbers: list[str] = field(default_factory=list)
 
-    # If true, a call that reaches High risk mid-call is redirected to a
-    # polite hangup via the Twilio REST API. Off by default: warn, don't act.
+    # If true, a call the LLM judges a scam is redirected to a polite hangup
+    # via the Twilio REST API. A regex-only High never ends a call. Off by
+    # default: warn, don't act.
     auto_intervene: bool = False
 
     # Privacy: whether family clients receive raw transcript text.
@@ -65,6 +71,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
+            host=os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1",
             port=int(os.environ.get("PORT", 8000)),
             forward_to=os.environ.get("FORWARD_TO", ""),
             project_id=os.environ.get("PROJECT_ID", "heylily"),

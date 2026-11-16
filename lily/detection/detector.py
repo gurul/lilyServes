@@ -16,6 +16,10 @@ judgment. Sources and design choices (links in README):
   choice). UNCERTAIN keeps watching without alerting.
 - Malformed model output never reads as "safe": any parse failure, non-object
   JSON, or unknown verdict gives "uncertain" (our design choice).
+- A failed model call is not a verdict. It returns "unavailable" (or
+  "uncertain" when the regex tier is already loud) with available=False, and
+  the caller does not feed it to fusion: an outage must not read as "safe"
+  and must not replace a real earlier verdict (our design choice).
 
 Transcripts are PII-sanitized (redact) before leaving the process.
 arXiv:2510.18493 (MASK) proposes sanitizing call transcripts because they
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from lily.config import settings
 from lily.detection.heuristics import score_text
@@ -38,6 +43,12 @@ log = logging.getLogger("lily.scam")
 TRANSCRIPT_WINDOW_CHARS = 4000
 
 VERDICTS = ("scam", "uncertain", "safe")
+# Reported when the model call itself failed. Not a judgment.
+UNAVAILABLE = "unavailable"
+
+# Health of the LLM tier, for /health: a wrong key or an empty credit balance
+# would otherwise look like a quiet day.
+llm_state: dict = {"last_ok_at": None, "last_error_at": None, "last_error": ""}
 
 # Criteria rubric adapted from the 11 voice-phishing evaluation criteria of
 # arXiv:2506.06180, extended with grandparent-scam patterns.
@@ -96,12 +107,16 @@ def parse_verdict(content: object) -> tuple[str, list[int], str]:
 async def analyze_scam(transcript: str) -> dict:
     """Criteria-rubric LLM judgment over a rolling, PII-sanitized window.
 
-    Returns {"verdict": ..., "criteria": [...], "reasoning": ..., "signals": [...]}.
-    Never raises; falls back to a heuristic-informed verdict on API failure.
+    Returns {"verdict": ..., "criteria": [...], "reasoning": ..., "signals": [...],
+    "available": bool}. Never raises. On API failure "available" is False and
+    the verdict is "unavailable" or "uncertain", never "safe".
     """
     heur = score_text(transcript)
     if not transcript.strip():
-        return {"verdict": "safe", "criteria": [], "reasoning": "No transcript yet.", "signals": []}
+        return {
+            "verdict": "safe", "criteria": [], "reasoning": "No transcript yet.",
+            "signals": [], "available": True,
+        }
 
     window = redact(transcript[-TRANSCRIPT_WINDOW_CHARS:])
     try:
@@ -118,17 +133,21 @@ async def analyze_scam(transcript: str) -> dict:
         )
     except Exception as e:
         log.warning("LLM scam analysis failed, deferring to heuristics: %s", e)
+        llm_state["last_error_at"] = time.time()
+        llm_state["last_error"] = type(e).__name__
+        available = False
         # Regex escalates but never clears: on LLM failure a heuristically
-        # loud transcript reads "uncertain", never "safe".
-        verdict = "uncertain" if heur.level != "Low" else "safe"
+        # loud transcript reads "uncertain", a quiet one "unavailable".
+        # Neither reads "safe": nothing judged the call.
+        verdict = "uncertain" if heur.level != "Low" else UNAVAILABLE
         criteria = []
-        reasoning = (
-            "Signals: " + ", ".join(heur.signals)
-            if heur.signals
-            else "Automated analysis unavailable."
+        reasoning = "Automated analysis unavailable." + (
+            " Signals: " + ", ".join(heur.signals) if heur.signals else ""
         )
 
     else:
+        llm_state["last_ok_at"] = time.time()
+        available = True
         try:
             content = response.choices[0].message.content
         except (AttributeError, IndexError, TypeError):
@@ -140,4 +159,5 @@ async def analyze_scam(transcript: str) -> dict:
         "criteria": criteria,
         "reasoning": reasoning,
         "signals": heur.signals,
+        "available": available,
     }

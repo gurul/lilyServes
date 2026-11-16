@@ -18,6 +18,7 @@ class CallSession:
     scam_level: str = "Low"
     scam_reasoning: str = ""
     heuristic_signals: list[str] = field(default_factory=list)
+    heuristic_score: int = 0  # regex score of the whole transcript so far
     fusion: RiskFusion = field(default_factory=RiskFusion)
     deepfake_score: float | None = None
     deepfake_buffer: bytearray = field(default_factory=bytearray)

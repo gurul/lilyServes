@@ -12,6 +12,7 @@ import logging
 import re
 
 from lily.config import settings
+from lily.memory.operational import redact
 from lily.summarizer import get_client
 
 log = logging.getLogger("lily.events")
@@ -47,7 +48,7 @@ async def extract_events(sentence: str) -> list[dict]:
             model=settings.event_model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": sentence},
+                {"role": "user", "content": redact(sentence)},
             ],
             temperature=0,
             max_tokens=150,
